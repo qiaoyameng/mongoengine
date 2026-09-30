@@ -265,6 +265,44 @@ document class as the first argument::
 Embedded documents can also leverage the flexibility of :ref:`dynamic-document-schemas`
 by inheriting :class:`~mongoengine.DynamicEmbeddedDocument`.
 
+Keyed embedded document lists
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When the elements of an :class:`~mongoengine.fields.EmbeddedDocumentListField`
+own a stable business key, pass it with ``key``::
+
+    class LineItem(EmbeddedDocument):
+        sku = StringField()
+        quantity = IntField()
+
+    class Order(Document):
+        items = EmbeddedDocumentListField(LineItem, key="sku")
+
+With a keyed list, saving the parent document no longer relies on array
+positions to push partial updates.  Instead the list is diffed against its
+last persisted state and the safe changes are expressed by key:
+
+* field modifications use the filtered positional operator with
+  ``arrayFilters`` (e.g. ``items.$[el].quantity`` with
+  ``[{"el.sku": "abc"}]``),
+* removals use ``$pull`` queried by key,
+* elements appended at the tail of the list use ``$push``.
+
+Because elements are matched by key, these updates keep targeting the
+correct element even if its array index shifted (reordering or removal
+happening concurrently or within the same document).
+
+The business key must be unique.  It cannot be changed in place on an
+existing element; duplicate key values raise
+:class:`~mongoengine.ValidationError`.
+
+Changes that cannot be expressed position-free (elements inserted in the
+middle, surviving elements reordered, removal and addition combined, ...)
+fall back to a whole-array ``$set`` guarded by a precondition on the
+persisted array.  If the array was modified concurrently the precondition
+no longer matches and the save raises
+:class:`~mongoengine.SaveConditionError` instead of silently overwriting the
+concurrent change.
+
 Dictionary Fields
 -----------------
 Often, an embedded document may be used instead of a dictionary – generally

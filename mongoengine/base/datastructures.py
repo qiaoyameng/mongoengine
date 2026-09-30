@@ -205,6 +205,68 @@ class BaseList(list):
 
 
 class EmbeddedDocumentList(BaseList):
+    """A :class:`BaseList` of embedded documents that optionally tracks a
+    stable business key and the last persisted state (``_keyed_snapshot``)
+    so that key-based (positional-free) updates can be generated on save.
+    """
+
+    _keyed_key = None
+    _keyed_snapshot = None
+    _keyed_snapshot_id = None
+
+    def __init__(
+        self, list_items, instance, name, key=None, inherited_baseline=None
+    ):
+        super().__init__(list_items, instance, name)
+        self._keyed_key = key
+        self._keyed_snapshot = None
+        self._keyed_snapshot_id = None
+        if inherited_baseline is not None:
+            # Reassignment / reorder of an existing keyed list: keep
+            # diffing against the same persisted baseline.
+            self._keyed_snapshot_id, self._keyed_snapshot = inherited_baseline
+        elif key is not None:
+            self._capture_keyed_snapshot()
+
+    def _capture_keyed_snapshot(self):
+        """Store the serialized current state as the persisted baseline and
+        tag every current element as belonging to that baseline (by object
+        identity).
+
+        When the list was replaced (e.g. reassigned or reordered) but still
+        contains elements that belonged to the previous list baseline, that
+        baseline is inherited unchanged instead of being reset.
+        """
+        instance = self._instance
+        if instance is None or not getattr(
+            instance, "_has_change_tracking_baseline", False
+        ):
+            return
+        try:
+            field = instance._fields.get(self._name)
+        except Exception:
+            field = None
+        if field is None or getattr(field, "key", None) != self._keyed_key:
+            return
+
+        from mongoengine.base.keyed import keyed_snapshot
+
+        try:
+            snapshot_id = id(self)
+            snapshot = keyed_snapshot(list(self), field)
+        except Exception:
+            # Serialization can fail while the parent document is still
+            # being initialized; the snapshot will be captured lazily.
+            return
+        for element in self:
+            try:
+                element._keyed_baseline_id = snapshot_id
+            except Exception:
+                pass
+        self._keyed_snapshot_id = snapshot_id
+        self._keyed_snapshot = snapshot
+
+
     @classmethod
     def __match_all(cls, embedded_doc, kwargs):
         """Return True if a given embedded doc matches all the filter

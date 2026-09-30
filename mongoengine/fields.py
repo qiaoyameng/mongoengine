@@ -991,13 +991,26 @@ class EmbeddedDocumentListField(ListField):
         :class:`~mongoengine.EmbeddedDocument`.
     """
 
-    def __init__(self, document_type, **kwargs):
+    def __init__(self, document_type, key=None, **kwargs):
         """
         :param document_type: The type of
          :class:`~mongoengine.EmbeddedDocument` the list will hold.
+        :param key: Optional name of a field on ``document_type`` that holds
+         a stable, unique business key for each element. When set, saves
+         diff the list against its last persisted state and emit updates
+         targeting elements by that key (using ``arrayFilters``) instead of
+         relying on array positions. Changes that cannot be expressed
+         safely fall back to a preconditioned whole-array replacement.
         :param kwargs: Keyword arguments passed into the parent :class:`~mongoengine.ListField`
         """
+        self.key = key
         super().__init__(field=EmbeddedDocumentField(document_type), **kwargs)
+        if key is not None and not isinstance(document_type, str):
+            if key not in document_type._fields:
+                raise ValueError(
+                    "EmbeddedDocumentListField key '%s' is not a field of %s"
+                    % (key, document_type.__name__)
+                )
 
 
 class SortedListField(ListField):

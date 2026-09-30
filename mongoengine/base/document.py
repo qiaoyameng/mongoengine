@@ -68,6 +68,7 @@ class BaseDocument:
         self._created = True
         self._changed_fields = []
         self._unset_fields = []
+        self._keyed_inherited_baselines = {}
         self._has_change_tracking_baseline = False
 
         if args:
@@ -827,6 +828,57 @@ class BaseDocument:
                 self._remove_path(set_data, path)
 
         return set_data, unset_data
+
+    def _refresh_keyed_snapshots(self):
+        """Re-baseline every keyed embedded document list after a save."""
+        EmbeddedDocumentListField = _import_class("EmbeddedDocumentListField")
+        for field_name, field in self._fields.items():
+            if not isinstance(field, EmbeddedDocumentListField) or not field.key:
+                continue
+            value = getattr(self, field_name)
+            if isinstance(value, EmbeddedDocumentList):
+                value._keyed_key = field.key
+                value._capture_keyed_snapshot()
+
+    def _keyed_list_plans(self):
+        """Build keyed update plans for changed keyed embedded lists.
+
+        Returns ``(plans, changed_prefixes)`` where ``changed_prefixes`` is
+        the set of database field names handled here (and so to be excluded
+        from the regular positional delta).
+        """
+        from mongoengine.base.keyed import build_keyed_list_update
+
+        EmbeddedDocumentListField = _import_class("EmbeddedDocumentListField")
+        plans = []
+        handled = set()
+        changed_fields, unset_fields = self._get_updated_fields()
+        for field_name, field in self._fields.items():
+            if not isinstance(field, EmbeddedDocumentListField) or not field.key:
+                continue
+            db_field = field.db_field
+            prefix = db_field
+            if not any(
+                path == prefix or path.startswith(prefix + ".")
+                for path in changed_fields + unset_fields
+            ):
+                continue
+            value = getattr(self, field_name)
+            if not isinstance(value, EmbeddedDocumentList):
+                continue
+            value._keyed_key = field.key
+            snapshot = value._keyed_snapshot
+            plan = build_keyed_list_update(
+                field=field,
+                db_field=db_field,
+                key_name=field.key,
+                current=value,
+                snapshot=snapshot,
+                snapshot_id=getattr(value, "_keyed_snapshot_id", None),
+            )
+            plans.append(plan)
+            handled.add(prefix)
+        return plans, handled
 
     @classmethod
     def _get_collection_name(cls):

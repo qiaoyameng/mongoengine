@@ -7,6 +7,13 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add an explicit keyed mode to ``EmbeddedDocumentListField`` through the new
+  ``key`` parameter. Keyed lists generate positional-free updates
+  (``arrayFilters`` for field modifications, keyed ``$pull`` for removals and
+  ``$push`` for tail appends) instead of relying on array indices. Changes
+  that cannot be expressed safely fall back to a whole-array ``$set`` guarded
+  by a precondition, raising ``SaveConditionError`` on concurrent
+  modification. Business keys must be unique and cannot be changed in place.
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
 
 Changes in 1.0.0

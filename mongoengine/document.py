@@ -497,6 +497,7 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         )
 
         self._clear_updated_fields()
+        self._refresh_keyed_snapshots()
         self._created = False
 
         return self
@@ -528,11 +529,34 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         return object_id
 
     def _get_update_doc(self):
-        """Return a dict containing all the $set and $unset operations
-        that should be sent to MongoDB based on the changes made to this
-        Document.
+        """Build the update document for an existing document.
+
+        Returns ``(update_doc, array_filters, extra_conditions)``.
+        ``array_filters`` holds the arrayFilters required by keyed
+        embedded document list updates and ``extra_conditions`` are query
+        clauses that must be AND-ed into the save filter (used as
+        preconditions by guarded whole-array replacements).
         """
+        plans, keyed_prefixes = self._keyed_list_plans()
+
         updates, removals = self._delta()
+        if keyed_prefixes:
+            updates = {
+                path: value
+                for path, value in updates.items()
+                if not any(
+                    path == prefix or path.startswith(prefix + ".")
+                    for prefix in keyed_prefixes
+                )
+            }
+            removals = {
+                path: value
+                for path, value in removals.items()
+                if not any(
+                    path == prefix or path.startswith(prefix + ".")
+                    for prefix in keyed_prefixes
+                )
+            }
 
         update_doc = {}
         if updates:
@@ -540,7 +564,27 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         if removals:
             update_doc["$unset"] = removals
 
-        return update_doc
+        array_filters = []
+        extra_conditions = []
+        for plan in plans:
+            if not plan.changed:
+                continue
+            if plan.safe:
+                for operator, ops in plan.update.items():
+                    update_doc.setdefault(operator, {})
+                    if operator in ("$set", "$unset", "$pull", "$push") and isinstance(
+                        update_doc[operator], dict
+                    ):
+                        update_doc[operator].update(ops)
+                    else:
+                        update_doc[operator] = ops
+                array_filters.extend(plan.array_filters)
+            else:
+                update_doc.setdefault("$set", {})[plan.db_field] = plan.replacement
+                if plan.condition:
+                    extra_conditions.append(plan.condition)
+
+        return update_doc, array_filters, extra_conditions
 
     def _integrate_shard_key(self, doc, select_dict):
         """Integrates the collection's shard key to the `select_dict`, which will be used for the query.
@@ -576,12 +620,24 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         select_dict = self._integrate_shard_key(doc, select_dict)
 
-        update_doc = self._get_update_doc()
+        update_doc, array_filters, extra_conditions = self._get_update_doc()
+        # A preconditioned (guarded) update must never upsert: a missing or
+        # concurrently modified document must make the save fail instead of
+        # creating a partial / corrupted document.
+        upsert = save_condition is None and not extra_conditions
+        if extra_conditions:
+            if save_condition is not None:
+                select_dict = {"$and": [select_dict, *extra_conditions]}
+            else:
+                select_dict["$and"] = list(extra_conditions)
         if update_doc:
-            upsert = save_condition is None
             with set_write_concern(collection, write_concern) as wc_collection:
                 last_error = wc_collection.update_one(
-                    select_dict, update_doc, upsert=upsert, session=_get_session()
+                    select_dict,
+                    update_doc,
+                    upsert=upsert,
+                    array_filters=array_filters or None,
+                    session=_get_session(),
                 ).raw_result
             if not upsert and last_error["n"] == 0:
                 raise SaveConditionError(

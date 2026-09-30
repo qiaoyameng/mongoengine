@@ -207,6 +207,18 @@ class BaseField:
                 if isinstance(v, EmbeddedDocument):
                     v._instance = weakref.proxy(instance)
 
+        previous = instance._data.get(self.name)
+        if (
+            getattr(self, "key", None)
+            and isinstance(value, (list, tuple))
+            and not isinstance(value, EmbeddedDocumentList)
+        ):
+            # Remember the previous keyed baseline for the replacement so
+            # that the wrapped list can inherit it (reassignment / reorder).
+            inherited = self._keyed_baseline_to_inherit(value, previous)
+            if inherited is not None:
+                instance._keyed_inherited_baselines[self.name] = inherited
+
         instance._data[self.name] = value
 
     def error(self, message="", errors=None, field_name=None):
@@ -378,10 +390,18 @@ class ComplexBaseField(BaseField):
 
         # Convert lists / values so we can watch for any changes on them
         if isinstance(value, (list, tuple)):
-            if issubclass(type(self), EmbeddedDocumentListField) and not isinstance(
-                value, EmbeddedDocumentList
-            ):
-                value = EmbeddedDocumentList(value, instance, self.name)
+            if issubclass(type(self), EmbeddedDocumentListField):
+                if not isinstance(value, EmbeddedDocumentList):
+                    stashed = instance.__dict__.get("_keyed_inherited_baselines")
+                    inherited = stashed.get(self.name) if stashed else None
+                    value = EmbeddedDocumentList(
+                        value,
+                        instance,
+                        self.name,
+                        key=getattr(self, "key", None),
+                        inherited_baseline=inherited,
+                    )
+                value = self._finalize_keyed_list(value, instance)
             elif not isinstance(value, BaseList):
                 value = BaseList(value, instance, self.name)
             instance._data[self.name] = value
@@ -399,8 +419,46 @@ class ComplexBaseField(BaseField):
                 ref_values=value, instance=instance, name=self.name, max_depth=1
             )
             value._dereferenced = True
+            if isinstance(value, EmbeddedDocumentList):
+                value = self._finalize_keyed_list(value, instance)
             instance._data[self.name] = value
 
+        return value
+
+    @staticmethod
+    def _keyed_baseline_to_inherit(value, previous):
+        """Return ``(snapshot_id, snapshot)`` from the previous keyed list
+        when the replacement still contains elements of that baseline."""
+        if not isinstance(previous, EmbeddedDocumentList):
+            return None
+        baseline_id = getattr(previous, "_keyed_snapshot_id", None)
+        baseline = getattr(previous, "_keyed_snapshot", None)
+        if baseline_id is None or baseline is None:
+            return None
+        EmbeddedDocument = _import_class("EmbeddedDocument")
+        tagged = any(
+            isinstance(element, EmbeddedDocument)
+            and getattr(element, "_keyed_baseline_id", None) == baseline_id
+            for element in value
+        )
+        return (baseline_id, baseline) if tagged else None
+
+    def _finalize_keyed_list(self, value, instance):
+        """Ensure a keyed embedded document list knows its business key and
+        holds a snapshot of the persisted state."""
+        if not isinstance(value, EmbeddedDocumentList):
+            return value
+        key = getattr(self, "key", None)
+        if not key:
+            return value
+        value._keyed_key = key
+        stashed = instance.__dict__.get("_keyed_inherited_baselines")
+        if value._keyed_snapshot is None and stashed:
+            inherited = stashed.pop(self.name, None)
+            if inherited is not None:
+                value._keyed_snapshot_id, value._keyed_snapshot = inherited
+        if value._keyed_snapshot is None:
+            value._capture_keyed_snapshot()
         return value
 
     def to_python(self, value):
