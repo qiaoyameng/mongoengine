@@ -354,6 +354,7 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         self._changed_fields = updated._changed_fields
         self._unset_fields = updated._unset_fields
+        self._keyed_list_baselines = updated._keyed_list_baselines
         self._has_change_tracking_baseline = updated._has_change_tracking_baseline
         self._created = False
 
@@ -532,14 +533,7 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         that should be sent to MongoDB based on the changes made to this
         Document.
         """
-        updates, removals = self._delta()
-
-        update_doc = {}
-        if updates:
-            update_doc["$set"] = updates
-        if removals:
-            update_doc["$unset"] = removals
-
+        update_doc, _, _, _ = self._get_update_spec()
         return update_doc
 
     def _integrate_shard_key(self, doc, select_dict):
@@ -576,12 +570,23 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
 
         select_dict = self._integrate_shard_key(doc, select_dict)
 
-        update_doc = self._get_update_doc()
+        update_doc, fallback_doc, precondition, array_filters, is_fallback = (
+            self._get_save_update_plan()
+        )
+        upsert = save_condition is None
+        if precondition:
+            select_dict.update(precondition)
+            upsert = False
+        if is_fallback:
+            update_doc = fallback_doc
         if update_doc:
-            upsert = save_condition is None
             with set_write_concern(collection, write_concern) as wc_collection:
                 last_error = wc_collection.update_one(
-                    select_dict, update_doc, upsert=upsert, session=_get_session()
+                    select_dict,
+                    update_doc,
+                    upsert=upsert,
+                    array_filters=array_filters or None,
+                    session=_get_session(),
                 ).raw_result
             if not upsert and last_error["n"] == 0:
                 raise SaveConditionError(
@@ -821,6 +826,7 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         else:
             self._changed_fields = obj._changed_fields
             self._unset_fields = obj._unset_fields
+            self._keyed_list_baselines = obj._keyed_list_baselines
         self._has_change_tracking_baseline = True
         self._created = False
         return self

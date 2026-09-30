@@ -34,6 +34,7 @@ class BaseDocument:
         "_changed_fields",
         "_unset_fields",
         "_has_change_tracking_baseline",
+        "_keyed_list_baselines",
         "_initialised",
         "_created",
         "_data",
@@ -69,6 +70,7 @@ class BaseDocument:
         self._changed_fields = []
         self._unset_fields = []
         self._has_change_tracking_baseline = False
+        self._keyed_list_baselines = {}
 
         if args:
             raise TypeError(
@@ -234,8 +236,10 @@ class BaseDocument:
         self._has_change_tracking_baseline = (
             not self._is_document or "_changed_fields" in data
         )
+        original_from_son = None
         if data.pop("_data_is_mongo", False) or isinstance(data["_data"], SON):
-            data["_data"] = self.__class__._from_son(data["_data"])._data
+            original_from_son = self.__class__._from_son(data["_data"])
+            data["_data"] = original_from_son._data
         for k in (
             "_changed_fields",
             "_unset_fields",
@@ -257,6 +261,8 @@ class BaseDocument:
         dynamic_fields = data.get("_dynamic_fields") or {}
         for k in dynamic_fields.keys():
             setattr(self, k, data["_data"].get(k))
+        if original_from_son is not None:
+            self._keyed_list_baselines = original_from_son._keyed_list_baselines
 
     def __iter__(self):
         return iter(self._fields_ordered)
@@ -633,6 +639,7 @@ class BaseDocument:
         self._changed_fields = []
         self._unset_fields = []
         self._has_change_tracking_baseline = True
+        self._capture_keyed_list_baselines(self, self.to_mongo())
 
     @staticmethod
     def _nestable_types_clear_updated_fields(data):
@@ -900,10 +907,436 @@ class BaseDocument:
 
         obj = cls(__auto_convert=False, _created=created, **data)
         obj._has_change_tracking_baseline = True
+        obj._keyed_list_baselines = {}
+        cls._capture_keyed_list_baselines(obj, son, reset=False)
         if not _auto_dereference:
             obj._fields = fields
 
         return obj
+
+    @classmethod
+    def _capture_keyed_list_baselines(
+        cls, document, son, path="", root_document=None, reset=True
+    ):
+        EmbeddedDocumentField = _import_class("EmbeddedDocumentField")
+        EmbeddedDocumentListField = _import_class("EmbeddedDocumentListField")
+
+        root_document = root_document or document
+        if reset:
+            document._keyed_list_baselines = {}
+        for field_name, field in document._fields.items():
+            db_path = f"{path}.{field.db_field}" if path else field.db_field
+            value = document._data.get(field_name)
+
+            if isinstance(field, EmbeddedDocumentListField) and field.keyed:
+                raw_value = son.get(field.db_field, None)
+                raw_items = (
+                    copy.deepcopy(raw_value)
+                    if raw_value is not None
+                    else None
+                )
+                items = list(value or [])
+                baseline = {
+                    "raw_items": raw_items,
+                    "items": items,
+                }
+                root_document._keyed_list_baselines[db_path] = baseline
+                if path:
+                    relative_path = db_path[len(path) + 1 :]
+                    document._keyed_list_baselines[relative_path] = baseline
+            elif isinstance(field, EmbeddedDocumentField) and value is not None:
+                raw_value = son.get(field.db_field, {})
+                cls._capture_keyed_list_baselines(
+                    value,
+                    raw_value,
+                    db_path,
+                    root_document=root_document,
+                    reset=False,
+                )
+
+    @staticmethod
+    def _paths_include_path(paths, path):
+        return path in paths or any(item.startswith(f"{path}.") for item in paths)
+
+    @staticmethod
+    def _remove_paths_under(paths, path):
+        return [
+            item
+            for item in paths
+            if item != path and not item.startswith(f"{path}.")
+        ]
+
+    @staticmethod
+    def _get_key(item, key_db_field, key_field):
+        if isinstance(item, BaseDocument):
+            serialized = item.to_mongo()
+            if key_db_field not in serialized:
+                raise InvalidDocumentError(
+                    f"Every item must provide the key field '{key_field}'"
+                )
+            return serialized[key_db_field]
+        if isinstance(item, dict):
+            if key_db_field not in item:
+                raise InvalidDocumentError(
+                    f"Every item must provide the key field '{key_field}'"
+                )
+            return item[key_db_field]
+        raise InvalidDocumentError("Keyed lists can only contain embedded documents")
+
+    def _keyed_list_delta(
+        self, path, field, baseline_path=None, filter_offset=0
+    ):
+        baseline_path = path if baseline_path is None else baseline_path
+        baseline = self._keyed_list_baselines.get(baseline_path)
+        current = self._data.get(field.name)
+        current = list(current or [])
+        key_db_field = field.key_db_field
+
+        def fallback():
+            update = {path: field.to_mongo(current)}
+            query = {}
+            if baseline is None:
+                query[path] = {"$exists": False}
+            elif baseline["raw_items"] is None:
+                query[path] = None
+            else:
+                query[path] = baseline["raw_items"]
+            return {"$set": update}, {"$set": update}, query, [], True
+
+        current_items = []
+        current_keys = []
+        for item in current:
+            key = self._get_key(item, key_db_field, field.key_field)
+            try:
+                duplicate = key in current_keys
+                current_keys.append(key)
+            except TypeError:
+                raise InvalidDocumentError(
+                    f"Key field '{field.key_field}' values must be hashable"
+                )
+            if duplicate:
+                raise InvalidDocumentError(
+                    f"Values for key field '{field.key_field}' must be unique"
+                )
+            current_items.append((key, item))
+
+        if baseline is None:
+            return fallback()
+
+        old_items = baseline["items"]
+        raw_old_items = baseline["raw_items"]
+        if raw_old_items is None:
+            return fallback()
+
+        old_by_identity = {id(item): item for item in old_items}
+        try:
+            old_keys = [item[key_db_field] for item in raw_old_items]
+        except (KeyError, TypeError):
+            raise InvalidDocumentError(
+                f"Every item must provide the key field '{field.key_field}'"
+            )
+        old_key_by_identity = {
+            id(item): raw_item[key_db_field]
+            for item, raw_item in zip(old_items, raw_old_items)
+        }
+        try:
+            duplicate_old_keys = len(old_keys) != len(set(old_keys))
+        except TypeError:
+            duplicate_old_keys = True
+        if duplicate_old_keys:
+            raise InvalidDocumentError(
+                f"Values for key field '{field.key_field}' must be unique"
+            )
+
+        old_map = dict(zip(old_keys, old_items))
+        modifications = {}
+        array_filters = []
+        old_positions = {key: index for index, key in enumerate(old_keys)}
+        replacement_keys = set()
+        kept_items = []
+
+        for key, item in current_items:
+            old_item = old_by_identity.get(id(item))
+            if old_item is not None:
+                old_key = old_key_by_identity[id(item)]
+                if old_key != key:
+                    raise InvalidDocumentError(
+                        "Keyed list item keys are immutable and cannot be changed "
+                        "in place"
+                    )
+                updates, unsets = item._delta()
+                modifications[key] = (updates, unsets)
+                kept_items.append(item)
+            elif key in old_map:
+                replacement_keys.add(key)
+                kept_items.append(old_map[key])
+
+        kept_old_positions = [
+            old_positions[
+                self._get_key(item, key_db_field, field.key_field)
+            ]
+            for item in kept_items
+        ]
+        deleted_keys = set(old_keys) - set(current_keys)
+        added_keys = set(current_keys) - set(old_keys)
+
+        if kept_old_positions != sorted(kept_old_positions):
+            return fallback()
+
+        added_positions = [
+            index
+            for index, (key, item) in enumerate(current_items)
+            if key in added_keys
+        ]
+        if added_positions and added_positions != list(
+            range(len(old_keys), len(current_keys))
+        ):
+            return fallback()
+
+        has_modifications = any(
+            updates or unsets for updates, unsets in modifications.values()
+        )
+        if (added_keys or deleted_keys) and (
+            has_modifications or replacement_keys
+        ):
+            return fallback()
+
+        safe_update = {}
+        full_update = {}
+        safe_query = {}
+        new_items = [item for key, item in current_items if key in added_keys]
+        if new_items:
+            serialized_new_items = field.to_mongo(new_items)
+            added_serialized_keys = [
+                item.to_mongo()[key_db_field] for item in new_items
+            ]
+            if len(new_items) == 1:
+                safe_query[path] = {
+                    "$exists": True,
+                    "$type": "array",
+                    "$not": {
+                        "$elemMatch": {key_db_field: added_serialized_keys[0]}
+                    }
+                }
+            else:
+                safe_query[path] = {
+                    "$exists": True,
+                    "$type": "array",
+                    "$not": {
+                        "$elemMatch": {
+                            key_db_field: {"$in": added_serialized_keys}
+                        }
+                    }
+                }
+            if len(serialized_new_items) == 1:
+                safe_update["$push"] = {path: serialized_new_items[0]}
+            else:
+                safe_update["$push"] = {path: {"$each": serialized_new_items}}
+
+        if deleted_keys:
+            safe_query[path] = {"$exists": True, "$type": "array"}
+            if len(deleted_keys) == 1:
+                deleted_key = next(iter(deleted_keys))
+                safe_update["$pull"] = {
+                    path: {key_db_field: deleted_key}
+                }
+            else:
+                safe_update["$pull"] = {
+                    path: {key_db_field: {"$in": list(deleted_keys)}}
+                }
+
+        if modifications:
+            set_values = {}
+            unset_values = {}
+            matching_keys = []
+            for key, item in current_items:
+                if key not in old_map:
+                    continue
+                updates, unsets = modifications.get(key, ({}, {}))
+                if key in replacement_keys:
+                    updates = field.to_mongo([item])[0]
+                    unsets = {}
+                if not updates and not unsets:
+                    continue
+                matching_keys.append(key)
+                identifier = f"item_{filter_offset + len(array_filters)}"
+                array_filters.append({f"{identifier}.{key_db_field}": key})
+                for sub_path, value in updates.items():
+                    set_values[f"{path}.$[{identifier}].{sub_path}"] = value
+                for sub_path in unsets:
+                    unset_values[f"{path}.$[{identifier}].{sub_path}"] = 1
+            if set_values:
+                safe_update["$set"] = set_values
+            if unset_values:
+                safe_update["$unset"] = unset_values
+            if matching_keys:
+                if len(matching_keys) == 1:
+                    safe_query[path] = {
+                        "$elemMatch": {key_db_field: matching_keys[0]}
+                    }
+                elif matching_keys:
+                    safe_query[path] = {
+                        "$all": [
+                            {
+                                "$elemMatch": {
+                                    key_db_field: matching_key
+                                }
+                            }
+                            for matching_key in matching_keys
+                        ]
+                    }
+
+        full_update["$set"] = {path: field.to_mongo(current)}
+        return safe_update, full_update, safe_query, array_filters, False
+
+    def _collect_keyed_list_updates(
+        self,
+        updates,
+        removals,
+        path="",
+        baseline_path="",
+        update_prefix="",
+    ):
+        EmbeddedDocumentField = _import_class("EmbeddedDocumentField")
+        EmbeddedDocumentListField = _import_class("EmbeddedDocumentListField")
+
+        safe_updates = []
+        fallback_updates = []
+        safe_queries = []
+        fallback_queries = []
+        array_filters = []
+
+        root_path = update_prefix or path
+        if root_path and (root_path in updates or root_path in removals):
+            return (
+                safe_updates,
+                fallback_updates,
+                safe_queries,
+                fallback_queries,
+                array_filters,
+            )
+
+        for field_name, field in self._fields.items():
+            db_path = f"{path}.{field.db_field}" if path else field.db_field
+            update_path = (
+                f"{update_prefix}.{field.db_field}"
+                if update_prefix
+                else field.db_field
+            )
+            relative_path = (
+                f"{baseline_path}.{field.db_field}" if baseline_path else field.db_field
+            )
+            value = self._data.get(field_name)
+
+            if isinstance(field, EmbeddedDocumentListField) and field.keyed:
+                changed = self._paths_include_path(updates, update_path)
+                changed = changed or self._paths_include_path(
+                    removals, update_path
+                )
+                if changed:
+                    updates[:] = self._remove_paths_under(updates, update_path)
+                    removals[:] = self._remove_paths_under(
+                        removals, update_path
+                    )
+                    safe, full, query, filters, is_fallback = (
+                        self._keyed_list_delta(
+                            update_path,
+                            field,
+                            relative_path,
+                            len(array_filters),
+                        )
+                    )
+                    if query:
+                        if is_fallback:
+                            fallback_updates.append(full)
+                            fallback_queries.append(query)
+                        else:
+                            safe_updates.append(safe)
+                            safe_queries.append(query)
+                    else:
+                        safe_updates.append(safe)
+                    array_filters.extend(filters)
+            elif isinstance(field, EmbeddedDocumentField) and value is not None:
+                (
+                    child_safe,
+                    child_full,
+                    child_safe_queries,
+                    child_fallback_queries,
+                    child_filters,
+                ) = (
+                    value._collect_keyed_list_updates(
+                        updates,
+                        removals,
+                        db_path,
+                        "",
+                        db_path,
+                    )
+                )
+                safe_updates.extend(child_safe)
+                fallback_updates.extend(child_full)
+                safe_queries.extend(child_safe_queries)
+                fallback_queries.extend(child_fallback_queries)
+                array_filters.extend(child_filters)
+
+        return (
+            safe_updates,
+            fallback_updates,
+            safe_queries,
+            fallback_queries,
+            array_filters,
+        )
+
+    def _get_save_update_plan(self):
+        updates, removals = self._delta()
+        update_paths = list(updates.keys())
+        removal_paths = list(removals.keys())
+        (
+            safe_groups,
+            full_groups,
+            safe_queries,
+            fallback_queries,
+            array_filters,
+        ) = (
+            self._collect_keyed_list_updates(update_paths, removal_paths)
+        )
+
+        update_doc = {}
+        conventional_set = {path: updates[path] for path in update_paths}
+        conventional_unset = {path: 1 for path in removal_paths}
+        if conventional_set:
+            update_doc["$set"] = conventional_set
+        if conventional_unset:
+            update_doc["$unset"] = conventional_unset
+
+        if full_groups:
+            full_update = copy.deepcopy(update_doc)
+            for group in safe_groups:
+                for operator, values in group.items():
+                    full_update.setdefault(operator, {}).update(values)
+            for group in full_groups:
+                for operator, values in group.items():
+                    full_update.setdefault(operator, {}).update(values)
+            precondition = {}
+            for condition in safe_queries + fallback_queries:
+                precondition.update(condition)
+            if not precondition:
+                full_update = update_doc
+            return update_doc, full_update, precondition, array_filters, True
+
+        for group in safe_groups:
+            for operator, values in group.items():
+                update_doc.setdefault(operator, {}).update(values)
+
+        precondition = {}
+        for condition in safe_queries:
+            precondition.update(condition)
+        return update_doc, update_doc, precondition, array_filters, False
+
+    def _get_update_spec(self):
+        update_doc, _, precondition, array_filters, is_fallback = (
+            self._get_save_update_plan()
+        )
+        return update_doc, precondition, array_filters, is_fallback
 
     @classmethod
     def _build_index_specs(cls, meta_indexes):

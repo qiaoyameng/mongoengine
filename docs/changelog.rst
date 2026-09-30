@@ -8,6 +8,8 @@ Development
 ===========
 - (Fill this out as you fix issues and develop your features).
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
+- Add explicit keyed mode to ``EmbeddedDocumentListField`` for stable-key
+  array filter updates with preconditioned whole-list fallback.
 
 Changes in 1.0.0
 ================

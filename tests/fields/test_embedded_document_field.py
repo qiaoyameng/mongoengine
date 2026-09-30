@@ -10,6 +10,7 @@ from mongoengine import (
     EmbeddedDocumentField,
     EmbeddedDocumentListField,
     GenericEmbeddedDocumentField,
+    InvalidDocumentError,
     IntField,
     InvalidQueryError,
     ListField,
@@ -465,3 +466,274 @@ class TestGenericEmbeddedDocumentField(MongoDBTestCase):
 
         copied_map_emb_doc = deepcopy(doc.wallet_map)
         assert copied_map_emb_doc["test"]._instance is None
+
+
+class TestKeyedEmbeddedDocumentListField:
+    def test_keyed_mode_is_explicit(self):
+        class KeyItem(EmbeddedDocument):
+            key = StringField()
+            name = StringField()
+
+        default_field = EmbeddedDocumentListField(KeyItem)
+        assert default_field.keyed is False
+        assert default_field.key_field is None
+
+        implicit_field = EmbeddedDocumentListField(KeyItem, key_field="name")
+        assert implicit_field.keyed is True
+        assert implicit_field.key_field == "name"
+
+        unknown_field = EmbeddedDocumentListField(KeyItem, keyed=True)
+        unknown_field.key_field = "missing"
+        with pytest.raises(InvalidQueryError, match="Unknown key field"):
+            unknown_field.validate([KeyItem(key="a")])
+
+    @staticmethod
+    def _document():
+        class Item(EmbeddedDocument):
+            business_key = StringField(db_field="bk")
+            name = StringField()
+
+        class KeyedDoc(Document):
+            title = StringField()
+            items = EmbeddedDocumentListField(
+                Item, keyed=True, key_field="business_key", db_field="items"
+            )
+
+        raw = {
+            "_id": ObjectId(),
+            "title": "post",
+            "items": [
+                {"bk": "a", "name": "A"},
+                {"bk": "b", "name": "B"},
+            ],
+        }
+        return Item, KeyedDoc, KeyedDoc._from_son(raw, created=False), raw
+
+    def test_field_modifications_use_keyed_array_filters(self):
+        Item, KeyedDoc, doc, raw = self._document()
+        doc.items[0].name = "A2"
+        doc.items[1].name = "B2"
+
+        update, _, _, array_filters, is_fallback = doc._get_save_update_plan()
+
+        assert update == {
+            "$set": {
+                "items.$[item_0].name": "A2",
+                "items.$[item_1].name": "B2",
+            }
+        }
+        assert array_filters == [
+            {"item_0.bk": "a"},
+            {"item_1.bk": "b"},
+        ]
+
+    def test_pull_and_append_do_not_use_indices(self):
+        Item, KeyedDoc, doc, raw = self._document()
+        doc.items.pop(0)
+        update, _, precondition, _, is_fallback = doc._get_save_update_plan()
+        assert update == {
+            "$pull": {"items": {"bk": "a"}}
+        }
+        assert precondition == {"items": {"$exists": True, "$type": "array"}}
+        assert is_fallback is False
+
+        Item, KeyedDoc, doc, raw = self._document()
+        doc.items.append(Item(business_key="c", name="C"))
+        update, _, precondition, _, is_fallback = doc._get_save_update_plan()
+        assert update == {
+            "$push": {"items": {"bk": "c", "name": "C"}}
+        }
+        assert precondition == {
+            "items": {
+                "$exists": True,
+                "$type": "array",
+                "$not": {"$elemMatch": {"bk": "c"}},
+            }
+        }
+        assert is_fallback is False
+
+    def test_reorder_or_unsafe_combination_uses_preconditioned_full_replace(self):
+        Item, KeyedDoc, doc, raw = self._document()
+        doc.items.reverse()
+
+        update, fallback, precondition, array_filters, is_fallback = (
+            doc._get_save_update_plan()
+        )
+        assert is_fallback is True
+
+        assert update == {}
+        assert fallback == {
+            "$set": {
+                "items": [
+                    {"bk": "b", "name": "B"},
+                    {"bk": "a", "name": "A"},
+                ]
+            }
+        }
+        assert precondition == {"items": raw["items"]}
+        assert array_filters == []
+
+        Item, KeyedDoc, doc, raw = self._document()
+        doc.items[0].name = "A2"
+        doc.items.pop(1)
+        _, fallback, precondition, array_filters, is_fallback = (
+            doc._get_save_update_plan()
+        )
+        assert fallback == {
+            "$set": {"items": [{"bk": "a", "name": "A2"}]}
+        }
+        assert precondition == {"items": raw["items"]}
+        assert array_filters == []
+
+    def test_in_place_key_change_is_rejected(self):
+        Item, KeyedDoc, doc, raw = self._document()
+        doc.items[0].business_key = "c"
+
+        with pytest.raises(InvalidDocumentError, match="immutable"):
+            doc._get_save_update_plan()
+
+    def test_duplicate_keys_are_rejected(self):
+        Item, KeyedDoc, doc, raw = self._document()
+        doc.items.append(Item(business_key="a", name="Duplicate"))
+
+        with pytest.raises(ValidationError, match="unique"):
+            doc.validate()
+
+    def test_two_copies_reorder_and_still_target_by_business_key(self):
+        Item, KeyedDoc, copy_a, raw = self._document()
+        _, _, copy_b, _ = self._document()
+
+        copy_a.items[0].name = "A2"
+        copy_a.items.insert(0, copy_a.items.pop(1))
+        _, fallback, precondition, array_filters, is_fallback = (
+            copy_a._get_save_update_plan()
+        )
+        assert precondition == {"items": raw["items"]}
+        assert fallback["$set"]["items"] == [
+            {"bk": "b", "name": "B"},
+            {"bk": "a", "name": "A2"},
+        ]
+        assert array_filters == []
+
+        copy_b.items[1].name = "B2"
+        update, _, precondition, array_filters, is_fallback = (
+            copy_b._get_save_update_plan()
+        )
+        assert precondition == {"items": {"$elemMatch": {"bk": "b"}}}
+        assert is_fallback is False
+        assert update == {"$set": {"items.$[item_0].name": "B2"}}
+        assert array_filters == [{"item_0.bk": "b"}]
+
+    def test_nested_keyed_list_uses_absolute_array_filter_path(self):
+        class NestedItem(EmbeddedDocument):
+            nested_key = StringField(db_field="nk")
+            name = StringField()
+
+        class Container(EmbeddedDocument):
+            nested_items = EmbeddedDocumentListField(
+                NestedItem, keyed=True, key_field="nested_key", db_field="nested"
+            )
+
+        class NestedDoc(Document):
+            container = EmbeddedDocumentField(Container)
+
+        raw = {
+            "_id": ObjectId(),
+            "container": {
+                "nested": [
+                    {"nk": "a", "name": "A"},
+                    {"nk": "b", "name": "B"},
+                ]
+            },
+        }
+        doc = NestedDoc._from_son(raw, created=False)
+        doc.container.nested_items[1].name = "B2"
+
+        update, _, precondition, array_filters, is_fallback = (
+            doc._get_save_update_plan()
+        )
+
+        assert is_fallback is False
+        assert update == {
+            "$set": {"container.nested.$[item_0].name": "B2"}
+        }
+        assert precondition == {
+            "container.nested": {"$elemMatch": {"nk": "b"}}
+        }
+        assert array_filters == [{"item_0.nk": "b"}]
+
+    def test_save_passes_array_filters_for_safe_update(self, monkeypatch):
+        class UpdateResult:
+            def __init__(self):
+                self.raw_result = {"n": 1, "updatedExisting": True}
+
+        class FakeCollection:
+            write_concern = type("WriteConcern", (), {"document": {}})()
+
+            def __init__(self):
+                self.calls = []
+
+            def with_options(self, **kwargs):
+                return self
+
+            def update_one(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return UpdateResult()
+
+        Item, KeyedDoc, doc, raw = self._document()
+        doc.items[1].name = "B2"
+        collection = FakeCollection()
+        monkeypatch.setattr(
+            KeyedDoc, "_get_collection", lambda self: collection
+        )
+
+        doc._save_update(doc.to_mongo(), None, {})
+
+        args, kwargs = collection.calls[0]
+        assert args[0] == {
+            "_id": raw["_id"],
+            "items": {"$elemMatch": {"bk": "b"}},
+        }
+        assert args[1] == {"$set": {"items.$[item_0].name": "B2"}}
+        assert kwargs["array_filters"] == [{"item_0.bk": "b"}]
+
+    def test_save_fallback_uses_old_array_precondition(self, monkeypatch):
+        class UpdateResult:
+            def __init__(self):
+                self.raw_result = {"n": 1, "updatedExisting": True}
+
+        class FakeCollection:
+            write_concern = type("WriteConcern", (), {"document": {}})()
+
+            def __init__(self):
+                self.calls = []
+
+            def with_options(self, **kwargs):
+                return self
+
+            def update_one(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return UpdateResult()
+
+        Item, KeyedDoc, doc, raw = self._document()
+        doc.items.reverse()
+        collection = FakeCollection()
+        monkeypatch.setattr(
+            KeyedDoc, "_get_collection", lambda self: collection
+        )
+
+        doc._save_update(doc.to_mongo(), None, {})
+
+        args, kwargs = collection.calls[0]
+        assert args[0]["_id"] == raw["_id"]
+        assert args[0]["items"] == raw["items"]
+        assert args[1] == {
+            "$set": {
+                "items": [
+                    {"bk": "b", "name": "B"},
+                    {"bk": "a", "name": "A"},
+                ]
+            }
+        }
+        assert kwargs["array_filters"] is None
+        assert kwargs["upsert"] is False

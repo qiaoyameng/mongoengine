@@ -986,18 +986,72 @@ class EmbeddedDocumentListField(ListField):
     """A :class:`~mongoengine.ListField` designed specially to hold a list of
     embedded documents to provide additional query helpers.
 
+    Set ``keyed=True`` (or provide ``key_field``) to identify embedded
+    documents by a stable business key when saving partial list changes.
+    Keyed mode uses filtered positional updates when possible and falls back
+    to a preconditioned whole-list replacement for changes that cannot be
+    represented safely with ``arrayFilters``.
+
     .. note::
         The only valid list values are subclasses of
         :class:`~mongoengine.EmbeddedDocument`.
     """
 
-    def __init__(self, document_type, **kwargs):
+    def __init__(self, document_type, *, keyed=False, key_field=None, **kwargs):
         """
         :param document_type: The type of
          :class:`~mongoengine.EmbeddedDocument` the list will hold.
+        :param keyed: Enable stable business-key based partial updates.
+        :param key_field: Name of the embedded document field used as the
+         stable business key. Implies ``keyed=True``.
         :param kwargs: Keyword arguments passed into the parent :class:`~mongoengine.ListField`
         """
+        if key_field is not None and keyed is False:
+            keyed = True
+        if keyed and key_field is None:
+            key_field = "key"
+
+        self.keyed = keyed
+        self.key_field = key_field
         super().__init__(field=EmbeddedDocumentField(document_type), **kwargs)
+
+    @property
+    def document_type(self):
+        return self.field.document_type
+
+    @property
+    def key_db_field(self):
+        key_field = self.document_type._fields.get(self.key_field)
+        if key_field is None:
+            raise InvalidQueryError(
+                f"Unknown key field '{self.key_field}' on "
+                f"{self.document_type.__name__}"
+            )
+        return key_field.db_field
+
+    def validate(self, value):
+        super().validate(value)
+        if not self.keyed:
+            return
+
+        key_db_field = self.key_db_field
+        serialized = self.to_mongo(value)
+        keys = []
+        for item in serialized:
+            if key_db_field not in item:
+                self.error(
+                    f"Every item must provide the key field '{self.key_field}'"
+                )
+            keys.append(item[key_db_field])
+        try:
+            duplicate_keys = len(keys) != len(set(keys))
+        except TypeError:
+            self.error(f"Key field '{self.key_field}' values must be hashable")
+        else:
+            if duplicate_keys:
+                self.error(
+                    f"Values for key field '{self.key_field}' must be unique"
+                )
 
 
 class SortedListField(ListField):
