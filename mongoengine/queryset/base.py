@@ -886,11 +886,57 @@ class BaseQuerySet:
 
         return new_qs
 
-    def select_related(self, max_depth=1):
-        """Handles dereferencing of :class:`~bson.dbref.DBRef` objects or
-        :class:`~bson.object_id.ObjectId` a maximum depth in order to cut down
-        the number queries to mongodb.
+    def select_related(
+        self,
+        budget=None,
+        max_depth=1,
+        max_objects=None,
+        max_queries_per_round=None,
+        prefetch_budget=None,
+    ):
+        """Eagerly dereference :class:`~bson.dbref.DBRef` objects or
+        :class:`~bson.object_id.ObjectId` values in order to cut down the
+        number of queries to mongodb.
+
+        When called with only ``max_depth`` the classic (unbounded) behaviour
+        is used. Passing a :class:`~mongoengine.prefetch.PrefetchBudget`
+        (``budget``/``prefetch_budget``) or the ``max_objects`` /
+        ``max_queries_per_round`` limits switches to the bounded prefetch
+        engine: each unique referenced object is fetched at most once, cycles
+        are not traversed twice, and unresolved references are left as
+        strictly-lazy
+        :class:`~mongoengine.base.datastructures.UnresolvedReference` markers.
+
+        The returned list of documents carries the
+        :class:`~mongoengine.prefetch.PrefetchReport`; retrieve it with
+        ``mongoengine.prefetch.last_report`` or
+        :meth:`~mongoengine.document.Document.get_prefetch_report` on any
+        returned document.
         """
+        from mongoengine.prefetch import PrefetchBudget, prefetch_related
+
+        budget = budget or prefetch_budget
+        if budget is not None and not isinstance(budget, PrefetchBudget):
+            # Backward-compatible positional ``max_depth``.
+            max_depth = budget
+            budget = None
+        if (
+            budget is not None
+            or max_objects is not None
+            or max_queries_per_round is not None
+        ):
+            docs = list(self.clone())
+            if budget is None:
+                budget = PrefetchBudget(
+                    max_depth=max_depth,
+                    max_objects=max_objects,
+                    max_queries_per_round=max_queries_per_round,
+                )
+            report = prefetch_related(docs, budget=budget)
+            for doc in docs:
+                doc._prefetch_report = report
+            return docs
+
         # Make select related work the same for querysets
         max_depth += 1
         queryset = self.clone()

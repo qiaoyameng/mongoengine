@@ -19,6 +19,7 @@ __all__ = (
     "BaseList",
     "EmbeddedDocumentList",
     "LazyReference",
+    "UnresolvedReference",
     # document
     "BaseDocument",
     # fields

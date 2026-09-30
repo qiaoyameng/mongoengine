@@ -11,6 +11,7 @@ __all__ = (
     "BaseList",
     "EmbeddedDocumentList",
     "LazyReference",
+    "UnresolvedReference",
 )
 
 
@@ -486,3 +487,82 @@ class LazyReference(DBRef):
 
     def __repr__(self):
         return f"<LazyReference({self.document_type}, {self.pk!r})>"
+
+
+class UnresolvedReference(LazyReference):
+    """A reference that a budgeted prefetch run deliberately did not resolve.
+
+    Unlike a plain :class:`~bson.dbref.DBRef`, it is *strictly* lazy:
+
+    * accessing an attribute (``ref.something``) or an item never fetches
+      the document,
+    * printing or serialising it never issues a query,
+    * calling :meth:`fetch` raises
+      :class:`~mongoengine.errors.PrefetchBudgetExhausted` instead of
+      silently bypassing the exhausted budget.
+
+    Start a new prefetch run (with a larger budget) to resolve it.
+
+    ``document_type`` may be ``None`` for generic references whose document
+    class is unknown; the MongoDB collection name is then available through the
+    inherited ``collection`` attribute.
+    """
+
+    __slots__ = ("path", "reason")
+
+    def __init__(self, document_type, pk, collection, path, reason):
+        self.document_type = document_type
+        self._cached_doc = None
+        self.passthrough = False
+        self.path = path
+        self.reason = reason
+        # Skip LazyReference.__init__: it requires a document_type to resolve
+        # the collection name, generic references may not know the class.
+        DBRef.__init__(self, collection, pk)
+
+    def fetch(self, force=False):
+        from mongoengine.errors import PrefetchBudgetExhausted
+
+        raise PrefetchBudgetExhausted(self)
+
+    def __getitem__(self, name):
+        # Never fetch on access, even for a passthrough-style lookup.
+        raise KeyError(name)
+
+    def __getattr__(self, name):
+        # __getattr__ only runs for names not found via normal lookup. The
+        # DBRef extras dict is never populated, so no attribute access can
+        # trigger a database query here.
+        raise AttributeError(name)
+
+    def __repr__(self):
+        target = (
+            self.document_type.__name__
+            if self.document_type is not None
+            else self.collection
+        )
+        return (
+            f"<UnresolvedReference({target}, {self.pk!r}) "
+            f"path={self.path!r} reason={self.reason!r}>"
+        )
+
+    def __deepcopy__(self, memo):
+        return UnresolvedReference(
+            self.document_type,
+            self.id,
+            self.collection,
+            self.path,
+            self.reason,
+        )
+
+    def __reduce__(self):
+        return (
+            UnresolvedReference,
+            (
+                self.document_type,
+                self.id,
+                self.collection,
+                self.path,
+                self.reason,
+            ),
+        )

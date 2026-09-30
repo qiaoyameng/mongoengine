@@ -40,6 +40,7 @@ class BaseDocument:
         "_dynamic_fields",
         "_auto_id_field",
         "_db_field_map",
+        "_prefetch_report",
         "__weakref__",
     )
 

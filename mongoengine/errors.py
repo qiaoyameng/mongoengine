@@ -14,6 +14,7 @@ __all__ = (
     "ValidationError",
     "SaveConditionError",
     "DeprecatedError",
+    "PrefetchBudgetExhausted",
 )
 
 
@@ -163,3 +164,22 @@ class DeprecatedError(MongoEngineException):
     """Raise when a user uses a feature that has been Deprecated"""
 
     pass
+
+
+class PrefetchBudgetExhausted(OperationError):
+    """Raised when an unresolved reference left behind by a budgeted
+    :func:`~mongoengine.prefetch.prefetch_related` run is explicitly asked to
+    resolve itself.
+
+    The reference is intentionally lazy, so printing, serialising or reading
+    its attributes never triggers a query; the caller must start a new
+    prefetch run (with a larger budget) instead.
+    """
+
+    def __init__(self, reference):
+        self.reference = reference
+        super().__init__(
+            "Prefetch budget exhausted, reference %s (%s) was not resolved. "
+            "Run prefetch_related again with a larger budget to resolve it."
+            % (reference.path, reference.collection)
+        )

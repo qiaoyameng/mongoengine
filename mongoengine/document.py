@@ -763,13 +763,65 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         self.__objects._collection_obj = collection
         return self
 
-    def select_related(self, max_depth=1):
-        """Handles dereferencing of :class:`~bson.dbref.DBRef` objects to
-        a maximum depth in order to cut down the number queries to mongodb.
+    def select_related(
+        self,
+        budget=None,
+        max_depth=1,
+        max_objects=None,
+        max_queries_per_round=None,
+        prefetch_budget=None,
+    ):
+        """Dereference :class:`~bson.dbref.DBRef` objects on this document.
+
+        By default this behaves like the classic unbounded eager dereferencing.
+        When an explicit prefetch budget is provided (either a
+        :class:`~mongoengine.prefetch.PrefetchBudget` as ``budget`` /
+        ``prefetch_budget`` or the ``max_objects`` /
+        ``max_queries_per_round`` limits), the walk is bounded:
+
+        * ``max_depth`` limits how many reference hops are followed,
+        * ``max_objects`` limits the number of unique referenced objects
+          pulled (the same object reached through several paths counts once),
+        * ``max_queries_per_round`` limits the number of queries issued per
+          prefetch round.
+
+        References left unresolved by the budget are replaced with strictly
+        lazy :class:`~mongoengine.base.datastructures.UnresolvedReference`
+        markers (printing or serialising them never issues a query). The
+        :class:`~mongoengine.prefetch.PrefetchReport` is available afterwards
+        via :meth:`get_prefetch_report`.
         """
+        from mongoengine.prefetch import PrefetchBudget, prefetch_related
+
+        budget = budget or prefetch_budget
+        if budget is not None and not isinstance(budget, PrefetchBudget):
+            # Backward-compatible positional ``max_depth``.
+            max_depth = budget
+            budget = None
+        if (
+            budget is not None
+            or max_objects is not None
+            or max_queries_per_round is not None
+        ):
+            if budget is None:
+                budget = PrefetchBudget(
+                    max_depth=max_depth,
+                    max_objects=max_objects,
+                    max_queries_per_round=max_queries_per_round,
+                )
+            report = prefetch_related(self, budget=budget)
+            self._prefetch_report = report
+            return self
+
         DeReference = _import_class("DeReference")
         DeReference()([self], max_depth + 1)
         return self
+
+    def get_prefetch_report(self):
+        """Return the :class:`~mongoengine.prefetch.PrefetchReport` produced by
+        the last budgeted :meth:`select_related` call on this document, or
+        ``None`` when no budgeted prefetch has been run."""
+        return getattr(self, "_prefetch_report", None)
 
     def reload(self, *fields, **kwargs):
         """Reloads all attributes from the database.

@@ -4,6 +4,7 @@ from mongoengine import (
     document,
     errors,
     fields,
+    prefetch,
     queryset,
     signals,
 )
@@ -16,6 +17,7 @@ from mongoengine.connection import *  # noqa: F401
 from mongoengine.document import *  # noqa: F401
 from mongoengine.errors import *  # noqa: F401
 from mongoengine.fields import *  # noqa: F401
+from mongoengine.prefetch import *  # noqa: F401
 from mongoengine.queryset import *  # noqa: F401
 from mongoengine.signals import *  # noqa: F401
 
@@ -23,6 +25,7 @@ __all__ = (
     list(document.__all__)
     + list(fields.__all__)
     + list(connection.__all__)
+    + list(prefetch.__all__)
     + list(queryset.__all__)
     + list(signals.__all__)
     + list(errors.__all__)

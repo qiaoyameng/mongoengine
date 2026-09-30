@@ -548,6 +548,44 @@ references to the depth of 1 level.  If you have more complicated documents and
 want to dereference more of the object at once then increasing the :attr:`max_depth`
 will dereference more levels of the document.
 
+Capping eager dereferencing with a prefetch budget
+--------------------------------------------------
+
+On a large or cyclic reference graph, ``select_related`` can follow far more
+references than intended. An *explicit prefetch budget* bounds the walk:
+
+* ``max_depth`` - how many reference hops away from the roots are resolved,
+* ``max_objects`` - the number of **unique** documents pulled from the
+  database (a document referenced from several paths only counts once),
+* ``max_queries_per_round`` - the number of batched queries issued per round
+  (one query per referenced collection; remaining collections are retried in
+  the next round).
+
+Pass a :class:`~mongoengine.prefetch.PrefetchBudget` to
+:func:`~mongoengine.queryset.QuerySet.select_related` (or the individual
+keyword limits)::
+
+    from mongoengine import PrefetchBudget
+
+    posts = Post.objects.select_related(
+        PrefetchBudget(max_depth=2, max_objects=50, max_queries_per_round=5)
+    )
+
+References that the budget did not reach are left in place as strictly-lazy
+:class:`~mongoengine.base.datastructures.UnresolvedReference` markers:
+printing or serialising them never issues a query and calling ``fetch()``
+raises :class:`~mongoengine.errors.PrefetchBudgetExhausted`. The
+:class:`~mongoengine.prefetch.PrefetchReport` (also returned directly by
+:func:`~mongoengine.prefetch.prefetch_related`) lists which paths remain
+unresolved and why::
+
+    from mongoengine import prefetch_related
+
+    report = prefetch_related(posts, max_depth=2, max_objects=50)
+    print(report)
+    # <PrefetchReport incomplete: rounds=3, queries=7, objects=50, unresolved=4>
+    print(report.describe_unresolved())
+
 Turning off dereferencing
 -------------------------
 

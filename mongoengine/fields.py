@@ -30,6 +30,7 @@ from mongoengine.base import (
     GeoJsonBaseField,
     LazyReference,
     ObjectIdField,
+    UnresolvedReference,
     _DocumentRegistry,
 )
 from mongoengine.base.utils import LazyRegexCompiler
@@ -1209,7 +1210,11 @@ class ReferenceField(BaseField):
         ref_value = instance._data.get(self.name)
         auto_dereference = instance._fields[self.name]._auto_dereference
         # Dereference DBRefs
-        if auto_dereference and isinstance(ref_value, DBRef):
+        if (
+            auto_dereference
+            and isinstance(ref_value, DBRef)
+            and not isinstance(ref_value, UnresolvedReference)
+        ):
             if hasattr(ref_value, "cls"):
                 # Dereference using the class type specified in the reference
                 cls = _DocumentRegistry.get(ref_value.cls)
@@ -1221,7 +1226,12 @@ class ReferenceField(BaseField):
         return super().__get__(instance, owner)
 
     def to_mongo(self, document):
-        if isinstance(document, DBRef):
+        if isinstance(document, UnresolvedReference):
+            # Keep the placeholder identifiable but safe to serialise.
+            if not self.dbref:
+                return document.id
+            return DBRef(document.collection, document.id)
+        elif isinstance(document, DBRef):
             if not self.dbref:
                 return document.id
             return document
@@ -1499,7 +1509,11 @@ class GenericReferenceField(BaseField):
         value = instance._data.get(self.name)
 
         auto_dereference = instance._fields[self.name]._auto_dereference
-        if auto_dereference and isinstance(value, dict):
+        if (
+            auto_dereference
+            and isinstance(value, dict)
+            and not isinstance(value, UnresolvedReference)
+        ):
             doc_cls = _DocumentRegistry.get(value["_cls"])
             instance._data[self.name] = self._lazy_load_ref(doc_cls, value["_ref"])
 
@@ -1520,6 +1534,21 @@ class GenericReferenceField(BaseField):
     def to_mongo(self, document):
         if document is None:
             return None
+
+        if isinstance(document, UnresolvedReference):
+            # Serialise as a normal generic reference instead of leaking the
+            # marker; no database access is involved.
+            class_name = (
+                document.document_type._class_name
+                if document.document_type is not None
+                else getattr(document, "_class_name", None)
+            )
+            if class_name is None:
+                raise ValueError(
+                    "Cannot serialise an unresolved generic reference to an "
+                    "unregistered document class"
+                )
+            return {"_cls": class_name, "_ref": DBRef(document.collection, document.id)}
 
         if isinstance(document, (dict, ObjectId, DBRef)):
             return document
@@ -2448,7 +2477,10 @@ class LazyReferenceField(BaseField):
         return self.document_type_obj
 
     def build_lazyref(self, value):
-        if isinstance(value, LazyReference):
+        if isinstance(value, UnresolvedReference):
+            # Budget markers must survive untouched (they carry path/reason).
+            return value
+        elif isinstance(value, LazyReference):
             if value.passthrough != self.passthrough:
                 value = LazyReference(
                     value.document_type, value.pk, passthrough=self.passthrough
@@ -2574,7 +2606,9 @@ class GenericLazyReferenceField(GenericReferenceField):
         super()._validate_choices(value)
 
     def build_lazyref(self, value):
-        if isinstance(value, LazyReference):
+        if isinstance(value, UnresolvedReference):
+            return value
+        elif isinstance(value, LazyReference):
             if value.passthrough != self.passthrough:
                 value = LazyReference(
                     value.document_type, value.pk, passthrough=self.passthrough
