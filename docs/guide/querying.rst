@@ -277,18 +277,41 @@ and provide the pipeline as a list
 Update with Array Operator
 --------------------------------
 It is possible to update specific value in array by use array_filters (arrayFilters) operator.
-This is done by using ``__raw__`` keyword argument to the update method and provide the arrayFilters as a list.
+The placeholders used in the update paths are written ``S[identifier]`` in Django-style
+updates (or ``$[identifier]`` in raw updates) and each ``array_filters`` entry must start
+with one of those identifiers. Array filters are model-aware: field aliases (``db_field``)
+and values are converted like in regular queries, so there is no need to write database
+field names by hand.
 
 `Update with Array Operator <https://www.mongodb.com/docs/manual/reference/operator/update/positional-filtered/>`_
 ::
 
     # assuming an initial 'tags' field == ['test1', 'test2', 'test3']
-    Page.objects().update(__raw__={'$set': {"tags.$[element]": 'test11111'}},
-                                  array_filters=[{"element": {'$eq': 'test2'}}],
+    Page.objects().update(**{'set__tags__S[element]': 'test11111'},
+                          array_filters=[{"element": 'test2'}])
 
     # updated 'tags' field == ['test1', 'test11111', 'test3']
 
+Placeholders also work with nested lists and embedded documents, e.g.::
+
+    Blog.objects().update(
+        **{'set__posts__S[post]__comments__S[comment]__name': 'new name'},
+        array_filters=[
+            {'post__title': 'some title'},
+            {'comment__vote__gte': 5},
+        ],
     )
+
+Every placeholder used in the update paths must be covered by an ``array_filters``
+entry (and vice versa), otherwise an ``InvalidQueryError`` is raised before anything
+is sent to the server. The same placeholder cannot be bound to different list
+element types.
+
+If you already have raw MongoDB array filters, wrap them in a ``__raw__`` dict so
+they are sent to the server untouched::
+
+    Page.objects().update(__raw__={'$set': {"tags.$[element]": 'test11111'}},
+                          array_filters={'__raw__': [{"element": {'$eq': 'test2'}}]})
 
 
 Sorting/Ordering results

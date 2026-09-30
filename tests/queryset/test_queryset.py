@@ -660,6 +660,166 @@ class TestQueryset(unittest.TestCase):
 
         assert testc_blogs.count() == 2
 
+    def test_update_array_filters_model_aware(self):
+        """Ensure that array_filters are resolved against the document
+        fields: placeholder variables are bound to the element type of the
+        list they iterate over and field aliases/values are converted."""
+
+        class Comment(EmbeddedDocument):
+            name = StringField(db_field="nm")
+            vote = IntField(db_field="vt")
+
+        class Post(EmbeddedDocument):
+            title = StringField(db_field="t")
+            comments = EmbeddedDocumentListField(Comment, db_field="cmts")
+
+        class Blog(Document):
+            posts = EmbeddedDocumentListField(Post, db_field="psts")
+
+        Blog.drop_collection()
+
+        Blog.objects.create(
+            posts=[
+                Post(title="p1", comments=[Comment(name="c1", vote=1)]),
+                Post(title="p2", comments=[Comment(name="c2", vote=10)]),
+            ]
+        )
+
+        with db_ops_tracker() as q:
+            Blog.objects().update_one(
+                **{"set__posts__S[post]__comments__S[comment]__name": "updated"},
+                array_filters=[
+                    {"post__title": "p2"},
+                    {"comment__vote__gte": 5},
+                ],
+            )
+
+        # Check the update request sent to the server
+        update_ops = [op for op in q.get_ops() if op["op"] == "update"]
+        assert len(update_ops) == 1
+        command = update_ops[0]["command"]
+        sent_update = command["updates"][0]
+        assert sent_update["u"] == {
+            "$set": {"psts.$[post].cmts.$[comment].nm": "updated"}
+        }
+        assert sent_update["arrayFilters"] == [
+            {"post.t": "p2"},
+            {"comment.vt": {"$gte": 5}},
+        ]
+
+        blog = Blog.objects.get()
+        assert blog.posts[0].comments[0].name == "c1"
+        assert blog.posts[1].comments[0].name == "updated"
+
+        Blog.drop_collection()
+
+    def test_update_array_filters_model_aware_elem_match(self):
+        """Ensure that paths inside $elemMatch of an array filter are
+        converted too."""
+
+        class Comment(EmbeddedDocument):
+            name = StringField(db_field="nm")
+            tags = ListField(StringField(db_field="tg"))
+
+        class Post(EmbeddedDocument):
+            comments = EmbeddedDocumentListField(Comment, db_field="cmts")
+
+        class Blog(Document):
+            posts = EmbeddedDocumentListField(Post, db_field="psts")
+
+        Blog.drop_collection()
+
+        Blog.objects.create(
+            posts=[
+                Post(comments=[Comment(name="c1", tags=["a", "b"])]),
+                Post(comments=[Comment(name="c2", tags=["c"])]),
+            ]
+        )
+
+        with db_ops_tracker() as q:
+            Blog.objects().update(
+                __raw__={"$set": {"psts.$[post].cmts.$[comment].nm": "updated"}},
+                array_filters=[
+                    {"post__comments__elemMatch": {"tags": "c"}},
+                    {"comment__name": "c2"},
+                ],
+            )
+
+        update_ops = [op for op in q.get_ops() if op["op"] == "update"]
+        assert len(update_ops) == 1
+        sent_update = update_ops[0]["command"]["updates"][0]
+        assert sent_update["arrayFilters"] == [
+            {"post.cmts": {"$elemMatch": {"tg": "c"}}},
+            {"comment.nm": "c2"},
+        ]
+
+        blog = Blog.objects.get()
+        assert blog.posts[0].comments[0].name == "c1"
+        assert blog.posts[1].comments[0].name == "updated"
+
+        Blog.drop_collection()
+
+    def test_update_array_filters_model_aware_errors(self):
+        """Ensure that invalid array_filters usage fails before anything
+        is sent to the server."""
+
+        class Blog(Document):
+            tags = ListField(StringField())
+            scores = ListField(IntField())
+
+        Blog.drop_collection()
+
+        # The same variable bound to different element types
+        with pytest.raises(InvalidQueryError):
+            Blog.objects().update(
+                __raw__={"$set": {"tags.$[x]": "a", "scores.$[x]": 1}},
+                array_filters=[{"x": "a"}],
+            )
+
+        # A variable that is not declared by any update path
+        with pytest.raises(InvalidQueryError):
+            Blog.objects().update(
+                __raw__={"$set": {"tags.$[element]": "a"}},
+                array_filters=[{"unknown": "a"}],
+            )
+
+        # A declared variable that is not used by any array filter
+        with pytest.raises(InvalidQueryError):
+            Blog.objects().update(
+                __raw__={"$set": {"tags.$[element]": "a", "scores.$[other]": 1}},
+                array_filters=[{"element": "a"}],
+            )
+
+        # A placeholder without any array_filters at all
+        with pytest.raises(InvalidQueryError):
+            Blog.objects().update(__raw__={"$set": {"tags.$[element]": "a"}})
+
+        Blog.drop_collection()
+
+    def test_update_array_filters_raw_mode(self):
+        """Ensure that explicit raw array_filters are sent untouched."""
+
+        class Blog(Document):
+            tags = ListField(StringField())
+
+        Blog.drop_collection()
+        Blog.objects.create(tags=["test1", "test2", "test3"])
+
+        raw_filters = [{"element": {"$eq": "test2"}}]
+        with db_ops_tracker() as q:
+            Blog.objects().update_one(
+                __raw__={"$set": {"tags.$[element]": "test11111"}},
+                array_filters={"__raw__": raw_filters},
+            )
+
+        update_ops = [op for op in q.get_ops() if op["op"] == "update"]
+        assert len(update_ops) == 1
+        sent_update = update_ops[0]["command"]["updates"][0]
+        assert sent_update["arrayFilters"] == [{"element": {"$eq": "test2"}}]
+        assert Blog.objects(tags="test11111").count() == 1
+
+        Blog.drop_collection()
+
     def test_update_using_positional_operator(self):
         """Ensure that the list fields can be updated using the positional
         operator."""

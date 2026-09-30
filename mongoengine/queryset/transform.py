@@ -1,3 +1,4 @@
+import re
 from collections import defaultdict
 
 import pymongo
@@ -8,7 +9,15 @@ from mongoengine.base import UPDATE_OPERATORS
 from mongoengine.common import _import_class
 from mongoengine.errors import InvalidQueryError
 
-__all__ = ("query", "update", "STRING_OPERATORS")
+__all__ = ("query", "update", "array_filters", "STRING_OPERATORS")
+
+# Matches a filtered positional operator placeholder, e.g. ``$[element]``
+# in a Mongo update path.
+ARRAY_FILTER_PLACEHOLDER_RE = re.compile(r"^\$\[(\w+)\]$")
+
+# Matches the Django-style counterpart of a filtered positional operator,
+# e.g. ``S[element]`` in an update keyword argument.
+ARRAY_FILTER_SHORTCUT_RE = re.compile(r"^S\[(\w+)\]$")
 
 COMPARISON_OPERATORS = (
     "ne",
@@ -324,6 +333,12 @@ def update(_doc_cls=None, **update):
                     # Convert the S operator to $
                     if field == "S":
                         field = "$"
+                    else:
+                        # Convert S[identifier] to a filtered positional
+                        # operator, e.g. S[element] -> $[element]
+                        array_filter_match = ARRAY_FILTER_SHORTCUT_RE.match(field)
+                        if array_filter_match:
+                            field = "$[%s]" % array_filter_match.group(1)
                     parts.append(field)
                     append_field = False
                 else:
@@ -433,6 +448,237 @@ def update(_doc_cls=None, **update):
             mongo_update[key].update(value)
 
     return mongo_update
+
+
+def array_filters(_doc_cls, update, array_filters):
+    """Transform model-aware ``array_filters`` into MongoDB syntax.
+
+    Placeholder variables used in the update paths (e.g. ``$[element]``)
+    are first bound to the element type of the corresponding
+    :class:`~mongoengine.fields.ListField`. Each array filter is then
+    resolved against the bound type so that field aliases (``db_field``)
+    and values are converted, exactly like regular queries.
+
+    :param _doc_cls: The document class being updated.
+    :param update: The already transformed (Mongo-style) update document.
+    :param array_filters: A list of Django-style array filters, or a
+        ``{"__raw__": [...]}`` dict to bypass the transformation entirely.
+    """
+    if isinstance(array_filters, dict):
+        # Explicit raw mode: pass the filters through untouched so they
+        # are never converted twice.
+        if "__raw__" in array_filters:
+            return array_filters["__raw__"]
+        raise InvalidQueryError(
+            "array_filters must be a list of filters (or {'__raw__': [...]})"
+        )
+
+    bindings = _array_filter_bindings(_doc_cls, update)
+
+    if array_filters is None:
+        if bindings:
+            raise InvalidQueryError(
+                "The update uses array filter placeholder(s) %s but no "
+                "array_filters were provided"
+                % ", ".join("$[%s]" % name for name in sorted(bindings))
+            )
+        return None
+
+    used = set()
+    transformed = []
+    for array_filter in array_filters:
+        mongo_filter = {}
+        for key, value in array_filter.items():
+            parts = key.split("__")
+            variable = parts[0]
+            if variable not in bindings:
+                raise InvalidQueryError(
+                    'Array filter variable "%s" is not declared by any '
+                    "placeholder in the update paths" % variable
+                )
+            used.add(variable)
+            element_field = bindings[variable]
+            mongo_filter.update(
+                _transform_array_filter(variable, element_field, parts[1:], value)
+            )
+        transformed.append(mongo_filter)
+
+    unused = set(bindings) - used
+    if unused:
+        raise InvalidQueryError(
+            "Array filter placeholder(s) %s declared in the update paths are "
+            "not used by any array_filters entry"
+            % ", ".join("$[%s]" % name for name in sorted(unused))
+        )
+
+    return transformed
+
+
+def _array_filter_bindings(_doc_cls, update):
+    """Bind each ``$[variable]`` placeholder found in the update paths to
+    the element field of the list it iterates over.
+    """
+    bindings = {}
+    for path in _iter_update_paths(update):
+        _bind_array_filter_variables(_doc_cls, path, bindings)
+    return bindings
+
+
+def _iter_update_paths(update):
+    """Yield the dotted paths targeted by a transformed update document."""
+    if isinstance(update, (list, tuple)):
+        # Update with an aggregation pipeline
+        for stage in update:
+            yield from _iter_update_paths(stage)
+    elif isinstance(update, dict):
+        for operator, spec in update.items():
+            if (
+                isinstance(operator, str)
+                and operator.startswith("$")
+                and isinstance(spec, dict)
+            ):
+                for path in spec:
+                    if isinstance(path, str):
+                        yield path
+
+
+def _bind_array_filter_variables(_doc_cls, path, bindings):
+    """Walk a Mongo update path along the document fields and record the
+    element field each ``$[variable]`` placeholder refers to.
+    """
+    doc_cls = _doc_cls
+    field = None
+    for part in path.split("."):
+        match = ARRAY_FILTER_PLACEHOLDER_RE.match(part)
+        if match or part == "$" or part.isdigit():
+            # A positional segment applies to the current list field
+            element_field = getattr(field, "field", None)
+            if element_field is None:
+                return
+            if match:
+                _bind_array_filter_variable(
+                    bindings, match.group(1), element_field, path
+                )
+            doc_cls = getattr(element_field, "document_type", None)
+            field = element_field
+            continue
+
+        # List fields are transparent in field paths, descend into the
+        # element document type when there is one
+        while field is not None and doc_cls is None and hasattr(field, "field"):
+            field = field.field
+            doc_cls = getattr(field, "document_type", None)
+        if doc_cls is None:
+            return
+
+        field = _lookup_field_by_db_field(doc_cls, part)
+        if field is None:
+            # Unresolvable (e.g. dynamic field), stop binding this path
+            return
+        doc_cls = getattr(field, "document_type", None)
+
+
+def _lookup_field_by_db_field(doc_cls, name):
+    """Look up a field on a document class by python or database name."""
+    field = doc_cls._fields.get(name)
+    if field is not None:
+        return field
+    for candidate in doc_cls._fields.values():
+        if candidate.db_field == name:
+            return candidate
+    return None
+
+
+def _bind_array_filter_variable(bindings, name, element_field, path):
+    """Record a variable binding, ensuring a variable is never bound to
+    conflicting element types.
+    """
+    existing = bindings.get(name)
+    if existing is not None and not _same_array_element_type(existing, element_field):
+        raise InvalidQueryError(
+            'Array filter variable "$[%s]" is bound to conflicting types '
+            "(%s and %s) in the update paths"
+            % (
+                name,
+                _array_element_type_name(existing),
+                _array_element_type_name(element_field),
+            )
+        )
+    bindings[name] = element_field
+
+
+def _same_array_element_type(field_a, field_b):
+    if field_a is field_b:
+        return True
+    if type(field_a) is not type(field_b):
+        return False
+    return getattr(field_a, "document_type", None) == getattr(
+        field_b, "document_type", None
+    )
+
+
+def _array_element_type_name(field):
+    document_type = getattr(field, "document_type", None)
+    if document_type is not None:
+        return document_type.__name__
+    return type(field).__name__
+
+
+def _transform_array_filter(variable, element_field, rest, value):
+    """Transform a single Django-style array filter entry into a
+    Mongo-style ``{variable.path: value}`` mapping.
+    """
+    document_type = getattr(element_field, "document_type", None)
+    if document_type is not None and rest:
+        if len(rest) == 1 and rest[0] in MATCH_OPERATORS:
+            raise InvalidQueryError(
+                'Cannot apply operator "%s" to array filter variable "%s" '
+                "without a field path" % (rest[0], variable)
+            )
+        # Resolve the remaining path and operators against the embedded
+        # document type, then prefix the variable back
+        sub_query = query(document_type, **{"__".join(rest): value})
+        return {
+            "%s.%s" % (variable, key): sub_value
+            for key, sub_value in sub_query.items()
+        }
+
+    if rest:
+        # An operator applied to the array element itself (e.g. tag__in)
+        if len(rest) > 1 or rest[0] not in MATCH_OPERATORS:
+            raise InvalidQueryError(
+                'Cannot resolve "%s" on array filter variable "%s"'
+                % ("__".join(rest), variable)
+            )
+        return {variable: _prepare_array_element_value(element_field, rest[0], value)}
+
+    # Filter on the whole array element
+    if isinstance(value, dict) and all(key.startswith("$") for key in value):
+        value = {
+            key: element_field.prepare_query_value(None, sub_value)
+            for key, sub_value in value.items()
+        }
+    else:
+        value = element_field.prepare_query_value(None, value)
+    return {variable: value}
+
+
+def _prepare_array_element_value(field, op, value):
+    """Prepare the value of an operator applied to an array element,
+    mirroring the conversion performed by :func:`query`.
+    """
+    singular_ops = [None, "ne", "gt", "gte", "lt", "lte", "not"]
+    singular_ops += STRING_OPERATORS
+    if op in singular_ops:
+        value = field.prepare_query_value(op, value)
+    elif op in ("in", "nin", "all", "near") and not isinstance(value, dict):
+        value = _prepare_query_for_iterable(field, op, value)
+
+    if op in ("match", "elemMatch"):
+        value = {"$elemMatch": field.prepare_query_value(op, value)}
+    elif op not in STRING_OPERATORS:
+        value = {"$" + op: value}
+    return value
 
 
 def _geo_operator(field, op, value):

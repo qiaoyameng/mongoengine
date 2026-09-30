@@ -8,6 +8,7 @@ Development
 ===========
 - (Fill this out as you fix issues and develop your features).
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
+- Make ``array_filters`` model-aware in ``QuerySet.update``/``update_one``/``modify``: placeholder variables in update paths (``S[identifier]`` or ``$[identifier]``) are bound to the corresponding list element type and array filters are converted like regular queries (field aliases and values). Raw filters remain supported through ``array_filters={"__raw__": [...]}``.
 
 Changes in 1.0.0
 ================

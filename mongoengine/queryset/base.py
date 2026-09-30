@@ -563,6 +563,11 @@ class BaseQuerySet:
         :param full_result: Return the associated ``pymongo.UpdateResult`` rather than just the number
             updated items
         :param array_filters: A list of filters specifying which array elements an update should apply.
+            Filters are model-aware: each key must start with a placeholder variable used in the
+            update paths (e.g. ``$[element]``, written ``S[element]`` in Django-style updates) and
+            field aliases and values are converted like regular queries
+            (e.g. ``[{"element__name": "foo"}]``). Pass ``{"__raw__": [...]}`` to provide
+            raw MongoDB array filters that are sent to the server untouched.
         :param update: Django-style update keyword arguments
 
         :returns the number of updated documents (unless ``full_result`` is True)
@@ -586,6 +591,9 @@ class BaseQuerySet:
             ]
         else:
             update = transform.update(queryset._document, **update)
+        array_filters = transform.array_filters(
+            queryset._document, update, array_filters
+        )
         # If doing an atomic upsert on an inheritable class
         # then ensure we add _cls to the update operation
         if upsert and "_cls" in query:
@@ -680,6 +688,7 @@ class BaseQuerySet:
         :param full_result: Return the associated ``pymongo.UpdateResult`` rather than just the number
             updated items
         :param array_filters: A list of filters specifying which array elements an update should apply.
+            See :meth:`~mongoengine.queryset.QuerySet.update` for the supported syntax.
         :param update: Django-style update keyword arguments
         :returns: the number of updated documents (unless ``full_result`` is True)
         """
@@ -711,6 +720,7 @@ class BaseQuerySet:
         :param new: return updated rather than original document
             (default ``False``)
         :param array_filters: A list of filters specifying which array elements an update should apply.
+            See :meth:`~mongoengine.queryset.QuerySet.update` for the supported syntax.
         :param update: Django-style update keyword arguments
         """
 
@@ -732,6 +742,9 @@ class BaseQuerySet:
 
         if not remove:
             update = transform.update(queryset._document, **update)
+            array_filters = transform.array_filters(
+                queryset._document, update, array_filters
+            )
         sort = queryset._ordering
 
         try:
