@@ -26,6 +26,7 @@ from mongoengine.queryset import (
     QuerySetManager,
     queryset_manager,
 )
+from mongoengine.queryset import transform
 from mongoengine.queryset.base import BaseQuerySet
 from tests.utils import (
     db_ops_tracker,
@@ -659,6 +660,194 @@ class TestQueryset(unittest.TestCase):
         testc_blogs = Blog.objects(tags="test_all1234577")
 
         assert testc_blogs.count() == 2
+
+    def test_model_aware_array_filters_transform(self):
+        """Model-aware array filters bind identifiers and convert aliases."""
+
+        class Reply(EmbeddedDocument):
+            body = StringField(db_field="bd")
+
+        class Comment(EmbeddedDocument):
+            author = StringField(db_field="au")
+            replies = EmbeddedDocumentListField(Reply, db_field="rp")
+
+        class Post(Document):
+            title = StringField()
+            tags = ListField(StringField(db_field="tg"))
+            comments = EmbeddedDocumentListField(Comment, db_field="cm")
+
+        update_kwargs = {"set__comments__Scomment__replies__Sreply__body": "x"}
+
+        # two levels of EmbeddedDocumentListField with db_field aliases,
+        # including an $elemMatch nested path
+        assert transform.array_filters(
+            Post,
+            [
+                {
+                    "comment__author": "joe",
+                    "comment__replies__elemMatch": {"body__ne": ""},
+                },
+                {"reply__body__in": ["a", "b"]},
+            ],
+            update_kwargs,
+        ) == [
+            {
+                "comment.au": "joe",
+                "comment.rp": {"$elemMatch": {"bd": {"$ne": ""}}},
+            },
+            {"reply.bd": {"$in": ["a", "b"]}},
+        ]
+
+        # the update path renders the filtered positional operators
+        assert transform.update(Post, **update_kwargs) == {
+            "$set": {"cm.$[comment].rp.$[reply].bd": "x"}
+        }
+
+        # scalar list element, bare value and operator syntax
+        assert transform.array_filters(
+            Post, [{"element": "test2"}], {"set__tags__Selement": "x"}
+        ) == [{"element": "test2"}]
+        assert transform.array_filters(
+            Post,
+            [{"element__ne": "test2"}],
+            {"set__tags__Selement": "x"},
+        ) == [{"element": {"$ne": "test2"}}]
+
+    def test_model_aware_array_filters_errors(self):
+        """Invalid identifiers are rejected before hitting the database."""
+
+        class Comment(EmbeddedDocument):
+            author = StringField(db_field="au")
+
+        class Other(EmbeddedDocument):
+            value = StringField()
+
+        class Post(Document):
+            tags = ListField(StringField())
+            nums = ListField(IntField())
+            comments = EmbeddedDocumentListField(Comment, db_field="cm")
+            others = ListField(EmbeddedDocumentField(Other))
+
+        # identifier bound to conflicting element types
+        with pytest.raises(InvalidQueryError):
+            transform.array_filters(
+                Post,
+                [{"element": "x"}],
+                {"set__tags__Selement": "x", "set__nums__Selement": 1},
+            )
+
+        # identifier bound to conflicting embedded document types
+        with pytest.raises(InvalidQueryError):
+            transform.array_filters(
+                Post,
+                [{"element__author": "x"}],
+                {
+                    "set__comments__Selement__author": "x",
+                    "set__others__Selement__value": "y",
+                },
+            )
+
+        # undeclared identifier in a filter
+        with pytest.raises(InvalidQueryError):
+            transform.array_filters(
+                Post,
+                [{"other__author": "a"}],
+                {"set__comments__Selement__author": "x"},
+            )
+
+        # declared but unused identifier
+        with pytest.raises(InvalidQueryError):
+            transform.array_filters(
+                Post,
+                [{"element__author": "a"}],
+                {
+                    "set__comments__Selement__author": "x",
+                    "set__tags__Stag": "y",
+                },
+            )
+
+        # field-like suffix on a scalar list
+        with pytest.raises(InvalidQueryError):
+            transform.array_filters(
+                Post,
+                [{"element__author": "a"}],
+                {"set__tags__Selement": "x"},
+            )
+
+    def test_model_aware_array_filters_update(self):
+        """End to end update using model-aware array filters."""
+
+        class Reply(EmbeddedDocument):
+            body = StringField(db_field="bd")
+
+        class Comment(EmbeddedDocument):
+            author = StringField(db_field="au")
+            replies = EmbeddedDocumentListField(Reply, db_field="rp")
+
+        class Post(Document):
+            comments = EmbeddedDocumentListField(Comment, db_field="cm")
+
+        Post.drop_collection()
+        Post(
+            comments=[
+                Comment(
+                    author="joe",
+                    replies=[Reply(body="hi"), Reply(body="yo")],
+                ),
+                Comment(author="jane", replies=[Reply(body="hi")]),
+            ]
+        ).save()
+
+        Post.objects().update(
+            set__comments__Scomment__replies__Sreply__body="done",
+            model_array_filters=[
+                {"comment__author": "joe"},
+                {"reply__body": "hi"},
+            ],
+        )
+
+        post = Post.objects().first()
+        assert post.comments[0].replies[0].body == "done"
+        assert post.comments[0].replies[1].body == "yo"
+        assert post.comments[1].replies[0].body == "hi"
+
+        # raw array_filters keeps working untouched
+        Post.objects().update(
+            __raw__={"$set": {"cm.$[c].rp.$[r].bd": "raw"}},
+            array_filters=[{"c.au": "jane"}, {"r.bd": "hi"}],
+        )
+        post = Post.objects().first()
+        assert post.comments[1].replies[0].body == "raw"
+
+        # update_one and modify accept model-aware filters too
+        Post.objects().update_one(
+            set__comments__Scomment__author="updated",
+            model_array_filters=[{"comment__author": "joe"}],
+        )
+        post = Post.objects().first()
+        assert post.comments[0].author == "updated"
+
+        modified = Post.objects().modify(
+            set__comments__Scomment__author="modified",
+            model_array_filters=[{"comment__author": "updated"}],
+            new=True,
+        )
+        assert modified.comments[0].author == "modified"
+
+        # the two modes cannot be combined
+        with pytest.raises(OperationError):
+            Post.objects().update(
+                set__comments__Scomment__author="x",
+                array_filters=[{"c.au": "joe"}],
+                model_array_filters=[{"comment__author": "joe"}],
+            )
+
+        with pytest.raises(OperationError):
+            Post.objects().modify(
+                set__comments__Scomment__author="x",
+                remove=True,
+                model_array_filters=[{"comment__author": "joe"}],
+            )
 
     def test_update_using_positional_operator(self):
         """Ensure that the list fields can be updated using the positional

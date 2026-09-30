@@ -1,3 +1,4 @@
+import re
 from collections import defaultdict
 
 import pymongo
@@ -8,7 +9,7 @@ from mongoengine.base import UPDATE_OPERATORS
 from mongoengine.common import _import_class
 from mongoengine.errors import InvalidQueryError
 
-__all__ = ("query", "update", "STRING_OPERATORS")
+__all__ = ("query", "update", "array_filters", "STRING_OPERATORS")
 
 COMPARISON_OPERATORS = (
     "ne",
@@ -324,6 +325,12 @@ def update(_doc_cls=None, **update):
                     # Convert the S operator to $
                     if field == "S":
                         field = "$"
+                    else:
+                        # Convert the filtered positional operator
+                        # S<identifier> to $[<identifier>]
+                        identifier = _array_filter_identifier(field)
+                        if identifier is not None:
+                            field = "$[%s]" % identifier
                     parts.append(field)
                     append_field = False
                 else:
@@ -542,3 +549,293 @@ def _prepare_query_for_iterable(field, op, value):
         )
 
     return [field.prepare_query_value(op, v) for v in value]
+
+
+# A filtered positional identifier is written as ``S<name>`` in django-style
+# update paths (e.g. ``set__tags__Selem__name``) and rendered as
+# ``$[elem].name``. ``S`` on its own is the plain positional operator ``$``.
+_ARRAY_FILTER_IDENTIFIER_RE = re.compile(r"^S(?P<name>[A-Za-z][A-Za-z0-9]*)$")
+
+
+def _array_filter_identifier(part):
+    """Return the identifier declared by an update path part or ``None``."""
+    match = _ARRAY_FILTER_IDENTIFIER_RE.match(part)
+    if match:
+        return match.group("name")
+    return None
+
+
+def _list_element_type(field):
+    """Return the field type stored by a list-like field or ``None``."""
+    ListField = _import_class("ListField")
+    EmbeddedDocumentListField = _import_class("EmbeddedDocumentListField")
+    if isinstance(field, (ListField, EmbeddedDocumentListField)):
+        return field.field
+    return None
+
+
+def _is_same_element_type(first, second):
+    """Return whether two list element fields are type-compatible."""
+    if type(first) is not type(second):
+        return False
+    EmbeddedDocumentField = _import_class("EmbeddedDocumentField")
+    if isinstance(first, EmbeddedDocumentField):
+        return first.document_type is second.document_type
+    return True
+
+
+def _element_type_label(field):
+    """Human readable description of a list element field."""
+    EmbeddedDocumentField = _import_class("EmbeddedDocumentField")
+    if isinstance(field, EmbeddedDocumentField):
+        return "%s(%s)" % (
+            type(field).__name__,
+            field.document_type._class_name,
+        )
+    return type(field).__name__
+
+
+def _resolve_update_parts(key):
+    """Strip the leading operator/trailing comparison from an update key."""
+    parts = key.split("__")
+
+    if len(parts) < 3 and parts[0] not in UPDATE_OPERATORS:
+        parts.insert(0, "set")
+    if parts[0] in UPDATE_OPERATORS:
+        parts = parts[1:]
+
+    if len(parts) > 1 and parts[-1] in COMPARISON_OPERATORS:
+        parts = parts[:-1]
+    elif len(parts) > 1 and parts[-1] == "":
+        parts = parts[:-1]
+
+    return parts
+
+
+def _collect_array_filter_bindings(doc_cls, update):
+    """Bind each filtered positional identifier to its list element field.
+
+    The element field is inferred from the list field preceding the
+    placeholder in the update path. An identifier bound to conflicting
+    element types raises :class:`~mongoengine.errors.InvalidQueryError`.
+    """
+    bindings = {}
+
+    for key in update:
+        if key == "__raw__":
+            continue
+
+        path_parts = _resolve_update_parts(key)
+        leading_operator = key.split("__", 1)[0]
+        if leading_operator in UPDATE_OPERATORS:
+            leading_operator = {
+                "push_all": "pushAll",
+                "pull_all": "pullAll",
+                "dec": "inc",
+                "add_to_set": "addToSet",
+                "set_on_insert": "setOnInsert",
+            }.get(leading_operator, leading_operator)
+        else:
+            leading_operator = "set"
+
+        current_field = None
+        for part in path_parts:
+            if part.isdigit():
+                continue
+
+            identifier = _array_filter_identifier(part)
+            # A declared field takes precedence over the placeholder syntax,
+            # so only attempt resolution when the part is not a placeholder
+            # or might shadow one as a real field name.
+            next_field = None
+            if identifier is None or current_field is None:
+                if current_field is None:
+                    lookup_name = part
+                    if lookup_name == "pk":
+                        lookup_name = doc_cls._meta["id_field"]
+                    next_field = doc_cls._fields.get(lookup_name)
+                else:
+                    inner_field = getattr(current_field, "field", None)
+                    if inner_field is not None and hasattr(
+                        inner_field, "lookup_member"
+                    ):
+                        next_field = inner_field.lookup_member(part)
+                    elif hasattr(current_field, "lookup_member"):
+                        next_field = current_field.lookup_member(part)
+
+                if next_field is not None:
+                    identifier = None
+
+            if identifier is not None:
+                if leading_operator in ("pull", "pullAll"):
+                    raise InvalidQueryError(
+                        "Array filter placeholders cannot be used with the "
+                        "'%s' update operator" % leading_operator
+                    )
+
+                element_field = _list_element_type(current_field)
+                if element_field is None:
+                    raise InvalidQueryError(
+                        "Array filter identifier '%s' in update path '%s' "
+                        "must immediately follow a ListField"
+                        % (identifier, key)
+                    )
+
+                existing = bindings.get(identifier)
+                if existing is not None and not _is_same_element_type(
+                    existing, element_field
+                ):
+                    raise InvalidQueryError(
+                        "Array filter identifier '%s' is bound to conflicting "
+                        "list element types: %s and %s"
+                        % (
+                            identifier,
+                            _element_type_label(existing),
+                            _element_type_label(element_field),
+                        )
+                    )
+                bindings[identifier] = element_field
+                # The placeholder stands for the list element.
+                current_field = element_field
+                continue
+
+            if next_field is None:
+                # Unresolved subfield: stop traversing this path. Later
+                # update validation reports any genuinely invalid path.
+                break
+
+            current_field = next_field
+
+    return bindings
+
+
+def _prepare_scalar_filter_value(field, value):
+    """Convert a scalar array filter value, transparently keeping operators."""
+    if isinstance(value, dict) and value and all(
+        isinstance(k, str) and k.startswith("$") for k in value
+    ):
+        return {
+            operator: _prepare_scalar_filter_operand(field, operator, operand)
+            for operator, operand in value.items()
+        }
+    return field.prepare_query_value(None, value)
+
+
+def _prepare_scalar_filter_operand(field, operator, value):
+    name = operator[1:]
+    if name in ("in", "nin", "all"):
+        return _prepare_query_for_iterable(field, name, value)
+    if name in COMPARISON_OPERATORS or name in STRING_OPERATORS:
+        return field.prepare_query_value(name, value)
+    return value
+
+
+def _convert_array_filter_expression(identifier, element_field, suffix, value):
+    """Convert one key/value pair of a model-aware array filter."""
+    EmbeddedDocumentField = _import_class("EmbeddedDocumentField")
+
+    if suffix:
+        if isinstance(element_field, EmbeddedDocumentField):
+            converted = query(
+                element_field.document_type, **{"__".join(suffix): value}
+            )
+            sub_key, sub_value = next(iter(converted.items()))
+            return "%s.%s" % (identifier, sub_key), sub_value
+
+        # Scalar list element: the suffix must be a comparison operator
+        operator = suffix[0]
+        if operator not in COMPARISON_OPERATORS and operator not in STRING_OPERATORS:
+            raise InvalidQueryError(
+                "Array filter '%s__%s' is invalid: '%s' is not an embedded "
+                "document field nor a query operator"
+                % (identifier, "__".join(suffix), operator)
+            )
+        operand = _prepare_scalar_filter_operand(
+            element_field, "$" + operator, value
+        )
+        return identifier, {"$" + operator: operand}
+
+    if isinstance(element_field, EmbeddedDocumentField):
+        return identifier, element_field.prepare_query_value(None, value)
+    return identifier, _prepare_scalar_filter_value(element_field, value)
+
+
+def array_filters(doc_cls, filters, update):
+    """Convert model-aware array filters into the MongoDB ``arrayFilters``.
+
+    :param doc_cls: document class the update is performed on
+    :param filters: list of dictionaries keyed by the filtered positional
+        identifiers used in the update paths (``elem`` /
+        ``elem__embedded_field``), with python field names and values
+    :param update: django-style update keyword arguments used to bind the
+        identifiers to the corresponding list element types
+
+    Field aliases (``db_field``) and python values are converted like regular
+    queries, including nested ``$elemMatch`` expressions on several levels of
+    embedded lists. Undeclared, unused or inconsistently typed identifiers
+    raise :class:`~mongoengine.errors.InvalidQueryError` before any request is
+    sent to the database.
+    """
+    if filters is None:
+        return None
+    if not isinstance(filters, (list, tuple)):
+        raise InvalidQueryError("array_filters must be a list of filters")
+
+    bindings = _collect_array_filter_bindings(doc_cls, update)
+
+    converted_filters = []
+    used_identifiers = set()
+
+    for filter_expr in filters:
+        if not isinstance(filter_expr, dict):
+            raise InvalidQueryError("Each array filter must be a dictionary")
+
+        converted_expr = {}
+        for key, value in filter_expr.items():
+            parts = key.split("__")
+            identifier = parts[0]
+            suffix = parts[1:]
+
+            if identifier not in bindings:
+                raise InvalidQueryError(
+                    "Array filter identifier '%s' is not declared in any "
+                    "update path (use an 'S%s' placeholder)"
+                    % (identifier, identifier)
+                )
+            used_identifiers.add(identifier)
+
+            converted_key, converted_value = _convert_array_filter_expression(
+                identifier, bindings[identifier], suffix, value
+            )
+            if converted_key in converted_expr:
+                existing_value = converted_expr[converted_key]
+                if isinstance(existing_value, dict) and isinstance(
+                    converted_value, dict
+                ):
+                    for operator in converted_value:
+                        if operator in existing_value:
+                            raise InvalidQueryError(
+                                "Conflicting array filter conditions on '%s' "
+                                "for operator '%s'"
+                                % (converted_key, operator)
+                            )
+                    existing_value.update(converted_value)
+                else:
+                    raise InvalidQueryError(
+                        "Conflicting array filter conditions on '%s'"
+                        % converted_key
+                    )
+            else:
+                converted_expr[converted_key] = converted_value
+
+        converted_filters.append(converted_expr)
+
+    unused_identifiers = set(bindings) - used_identifiers
+    if unused_identifiers:
+        raise InvalidQueryError(
+            "The array filter identifier(s) %s are declared in update paths "
+            "but no matching array filter was provided"
+            % ", ".join(sorted(unused_identifiers))
+        )
+
+    return converted_filters

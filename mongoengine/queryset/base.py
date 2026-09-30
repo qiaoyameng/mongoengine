@@ -547,6 +547,7 @@ class BaseQuerySet:
         read_concern=None,
         full_result=False,
         array_filters=None,
+        model_array_filters=None,
         **update,
     ):
         """Perform an atomic update on the fields matched by the query.
@@ -562,13 +563,26 @@ class BaseQuerySet:
         :param read_concern: Override the read concern for the operation
         :param full_result: Return the associated ``pymongo.UpdateResult`` rather than just the number
             updated items
-        :param array_filters: A list of filters specifying which array elements an update should apply.
+        :param array_filters: A list of raw MongoDB filters specifying which
+            array elements an update should apply. These filters are passed
+            through untouched, so they must use ``db_field`` names.
+        :param model_array_filters: A list of model-aware filters. Each key is
+            a filtered positional identifier declared with an ``S<identifier>``
+            placeholder in the update paths (e.g. ``elem`` or
+            ``elem__field``). Python field names and values are converted
+            automatically. Cannot be used together with ``array_filters``.
         :param update: Django-style update keyword arguments
 
         :returns the number of updated documents (unless ``full_result`` is True)
         """
         if not update and not upsert:
             raise OperationError("No update parameters, would remove data")
+
+        if array_filters is not None and model_array_filters is not None:
+            raise OperationError(
+                "array_filters and model_array_filters cannot be used "
+                "together"
+            )
 
         if write_concern is None:
             write_concern = {}
@@ -580,11 +594,20 @@ class BaseQuerySet:
         if "__raw__" in update and isinstance(
             update["__raw__"], list
         ):  # Case of Update with Aggregation Pipeline
+            if model_array_filters is not None:
+                raise OperationError(
+                    "model_array_filters cannot be used with an aggregation "
+                    "pipeline update"
+                )
             update = [
                 transform.update(queryset._document, **{"__raw__": u})
                 for u in update["__raw__"]
             ]
         else:
+            if model_array_filters is not None:
+                array_filters = transform.array_filters(
+                    queryset._document, model_array_filters, update
+                )
             update = transform.update(queryset._document, **update)
         # If doing an atomic upsert on an inheritable class
         # then ensure we add _cls to the update operation
@@ -665,6 +688,7 @@ class BaseQuerySet:
         write_concern=None,
         full_result=False,
         array_filters=None,
+        model_array_filters=None,
         **update,
     ):
         """Perform an atomic update on the fields of the first document
@@ -679,7 +703,10 @@ class BaseQuerySet:
             will force an fsync on the primary server.
         :param full_result: Return the associated ``pymongo.UpdateResult`` rather than just the number
             updated items
-        :param array_filters: A list of filters specifying which array elements an update should apply.
+        :param array_filters: A list of raw MongoDB filters specifying which
+            array elements an update should apply (passed through untouched).
+        :param model_array_filters: A list of model-aware filters, see
+            :meth:`QuerySet.update`.
         :param update: Django-style update keyword arguments
         :returns: the number of updated documents (unless ``full_result`` is True)
         """
@@ -689,6 +716,7 @@ class BaseQuerySet:
             write_concern=write_concern,
             full_result=full_result,
             array_filters=array_filters,
+            model_array_filters=model_array_filters,
             **update,
         )
 
@@ -698,6 +726,7 @@ class BaseQuerySet:
         remove=False,
         new=False,
         array_filters=None,
+        model_array_filters=None,
         **update,
     ):
         """Update and return the updated document.
@@ -710,15 +739,32 @@ class BaseQuerySet:
         :param remove: remove rather than updating (default ``False``)
         :param new: return updated rather than original document
             (default ``False``)
-        :param array_filters: A list of filters specifying which array elements an update should apply.
+        :param array_filters: A list of raw MongoDB filters specifying which
+            array elements an update should apply (passed through untouched).
+        :param model_array_filters: A list of model-aware filters, see
+            :meth:`QuerySet.update`. Cannot be used together with
+            ``array_filters``.
         :param update: Django-style update keyword arguments
         """
 
         if remove and new:
             raise OperationError("Conflicting parameters: remove and new")
 
+        if array_filters is not None and model_array_filters is not None:
+            raise OperationError(
+                "array_filters and model_array_filters cannot be used "
+                "together"
+            )
+
         if not update and not upsert and not remove:
             raise OperationError("No update parameters, must either update or remove")
+
+        if remove and (
+            array_filters is not None or model_array_filters is not None
+        ):
+            raise OperationError(
+                "array filters cannot be used when remove=True"
+            )
 
         if self._none or self._empty:
             return None
@@ -731,6 +777,10 @@ class BaseQuerySet:
             query["$where"] = where_clause
 
         if not remove:
+            if model_array_filters is not None:
+                array_filters = transform.array_filters(
+                    queryset._document, model_array_filters, update
+                )
             update = transform.update(queryset._document, **update)
         sort = queryset._ordering
 

@@ -290,6 +290,41 @@ This is done by using ``__raw__`` keyword argument to the update method and prov
 
     )
 
+The ``array_filters`` argument is a raw MongoDB document: the keys must use
+the ``db_field`` names and the values are passed through untouched.
+
+A model-aware alternative is available through ``model_array_filters``.
+Declare a filtered positional identifier in the update path using the
+``S<identifier>`` placeholder (rendered as ``$[identifier]``); the
+corresponding filter then references the same identifier. Field aliases and
+python values are converted automatically, including nested
+``elemMatch`` paths on several levels of embedded lists::
+
+    class Reply(EmbeddedDocument):
+        body = StringField(db_field="bd")
+
+    class Comment(EmbeddedDocument):
+        author = StringField(db_field="au")
+        replies = EmbeddedDocumentListField(Reply, db_field="rp")
+
+    class Post(Document):
+        comments = EmbeddedDocumentListField(Comment, db_field="cm")
+
+    Post.objects().update(
+        set__comments__Scomment__replies__Sreply__body="done",
+        model_array_filters=[
+            {"comment__author": "joe"},
+            {"reply__body": "hi"},
+        ],
+    )
+    # produces {'$set': {'cm.$[comment].rp.$[reply].bd': 'done'}} with
+    # arrayFilters=[{'comment.au': 'joe'}, {'reply.bd': 'hi'}]
+
+An identifier must always be declared in an update path and provided with a
+matching filter; binding the same identifier to lists with incompatible
+element types raises ``InvalidQueryError`` before the request is sent.
+``array_filters`` (raw) and ``model_array_filters`` cannot be combined.
+
 
 Sorting/Ordering results
 ========================

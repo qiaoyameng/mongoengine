@@ -7,6 +7,11 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add model-aware ``model_array_filters`` argument to ``QuerySet.update``,
+  ``QuerySet.update_one`` and ``QuerySet.modify``. Filtered positional
+  identifiers are declared with an ``S<identifier>`` placeholder in the
+  update paths; field aliases and values in the filters are converted
+  automatically (including nested ``$elemMatch`` paths).
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
 
 Changes in 1.0.0
