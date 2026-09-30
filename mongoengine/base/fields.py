@@ -365,6 +365,7 @@ class ComplexBaseField(BaseField):
             instance._initialised
             and dereference
             and instance._data.get(self.name)
+            and not getattr(instance._data[self.name], "_budgeted_dereferenced", False)
             and not getattr(instance._data[self.name], "_dereferenced", False)
         ):
             ref_values = instance._data.get(self.name)
@@ -393,6 +394,7 @@ class ComplexBaseField(BaseField):
             auto_dereference
             and instance._initialised
             and isinstance(value, (BaseList, BaseDict))
+            and not getattr(value, "_budgeted_dereferenced", False)
             and not value._dereferenced
         ):
             value = self._lazy_load_refs(

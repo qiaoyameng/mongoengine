@@ -763,12 +763,54 @@ class Document(BaseDocument, metaclass=TopLevelDocumentMetaclass):
         self.__objects._collection_obj = collection
         return self
 
-    def select_related(self, max_depth=1):
+    def select_related(
+        self,
+        max_depth=1,
+        budget=None,
+        max_unique_objects=None,
+        max_queries_per_round=None,
+        return_report=False,
+    ):
         """Handles dereferencing of :class:`~bson.dbref.DBRef` objects to
         a maximum depth in order to cut down the number queries to mongodb.
+
+        Pass ``max_unique_objects`` and/or ``max_queries_per_round`` to use
+        an explicit prefetch budget. When ``return_report`` is true, returns
+        ``(self, report)`` where ``report`` lists references left unresolved.
         """
         DeReference = _import_class("DeReference")
-        DeReference()([self], max_depth + 1)
+        PrefetchBudget = _import_class("PrefetchBudget")
+        dereferencer = DeReference()
+
+        if budget is not None and not isinstance(budget, PrefetchBudget):
+            raise TypeError("budget must be a PrefetchBudget instance")
+        if budget is not None and (
+            max_unique_objects is not None
+            or max_queries_per_round is not None
+        ):
+            raise TypeError(
+                "max_unique_objects and max_queries_per_round cannot be "
+                "combined with budget"
+            )
+
+        if (
+            budget is not None
+            or max_unique_objects is not None
+            or max_queries_per_round is not None
+            or return_report
+        ):
+            if budget is None:
+                budget = PrefetchBudget(
+                    max_depth=max_depth,
+                    max_unique_objects=max_unique_objects,
+                    max_queries_per_round=max_queries_per_round,
+                )
+            _, report = dereferencer([self], budget=budget, root_prefix="")
+            if return_report:
+                return self, report
+            return self
+
+        dereferencer([self], max_depth + 1)
         return self
 
     def reload(self, *fields, **kwargs):

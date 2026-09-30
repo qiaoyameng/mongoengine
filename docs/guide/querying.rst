@@ -548,6 +548,32 @@ references to the depth of 1 level.  If you have more complicated documents and
 want to dereference more of the object at once then increasing the :attr:`max_depth`
 will dereference more levels of the document.
 
+Explicit prefetch budgets
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Deep reference graphs can share the same object through several paths or point
+back to already loaded documents. Pass a prefetch budget to cap the work done by
+``select_related``::
+
+    group, report = group.select_related(
+        max_depth=3,
+        max_unique_objects=100,
+        max_queries_per_round=10,
+        return_report=True,
+    )
+
+An object reached through more than one path counts once, and cycles do not
+restart traversal of an already loaded object. If a limit is reached, the
+remaining references stay represented as inert, identifiable lazy references.
+Printing or serializing those values does not fetch additional documents; use
+their explicit ``fetch()`` method when deliberately loading one is required.
+
+The returned :class:`~mongoengine.prefetch.PrefetchReport` records the number of
+queries and unique objects fetched, how many reference levels were reached,
+which limit stopped prefetching, and ``unresolved_paths`` for references that
+were not loaded. A :class:`~mongoengine.prefetch.PrefetchBudget` object can also
+be passed with the ``budget`` keyword argument.
+
 Turning off dereferencing
 -------------------------
 

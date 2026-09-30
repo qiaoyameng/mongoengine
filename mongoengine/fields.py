@@ -27,6 +27,7 @@ from mongoengine.base import (
     BaseDocument,
     BaseField,
     ComplexBaseField,
+    BudgetedLazyReference,
     GeoJsonBaseField,
     LazyReference,
     ObjectIdField,
@@ -1209,7 +1210,11 @@ class ReferenceField(BaseField):
         ref_value = instance._data.get(self.name)
         auto_dereference = instance._fields[self.name]._auto_dereference
         # Dereference DBRefs
-        if auto_dereference and isinstance(ref_value, DBRef):
+        if (
+            auto_dereference
+            and isinstance(ref_value, DBRef)
+            and not isinstance(ref_value, LazyReference)
+        ):
             if hasattr(ref_value, "cls"):
                 # Dereference using the class type specified in the reference
                 cls = _DocumentRegistry.get(ref_value.cls)
@@ -1520,6 +1525,17 @@ class GenericReferenceField(BaseField):
     def to_mongo(self, document):
         if document is None:
             return None
+
+        if isinstance(document, LazyReference) and document.document_type is not None:
+            return {
+                "_cls": document.document_type._class_name,
+                "_ref": DBRef(
+                    document.document_type._get_collection_name(), document.pk
+                ),
+            }
+
+        if isinstance(document, LazyReference):
+            return DBRef(document.collection, document.pk)
 
         if isinstance(document, (dict, ObjectId, DBRef)):
             return document

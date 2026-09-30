@@ -19,6 +19,8 @@ __all__ = (
     "BaseList",
     "EmbeddedDocumentList",
     "LazyReference",
+    "BudgetedLazyReference",
+    "GenericBudgetedLazyReference",
     # document
     "BaseDocument",
     # fields

@@ -886,15 +886,57 @@ class BaseQuerySet:
 
         return new_qs
 
-    def select_related(self, max_depth=1):
+    def select_related(
+        self,
+        max_depth=1,
+        budget=None,
+        max_unique_objects=None,
+        max_queries_per_round=None,
+        return_report=False,
+    ):
         """Handles dereferencing of :class:`~bson.dbref.DBRef` objects or
         :class:`~bson.object_id.ObjectId` a maximum depth in order to cut down
         the number queries to mongodb.
+
+        Pass ``max_unique_objects`` and/or ``max_queries_per_round`` to use
+        an explicit prefetch budget. When ``return_report`` is true, returns
+        ``(queryset, report)`` where ``report`` lists references left
+        unresolved.
         """
-        # Make select related work the same for querysets
-        max_depth += 1
         queryset = self.clone()
-        return queryset._dereference(queryset, max_depth=max_depth)
+        PrefetchBudget = _import_class("PrefetchBudget")
+
+        if budget is not None and not isinstance(budget, PrefetchBudget):
+            raise TypeError("budget must be a PrefetchBudget instance")
+        if budget is not None and (
+            max_unique_objects is not None
+            or max_queries_per_round is not None
+        ):
+            raise TypeError(
+                "max_unique_objects and max_queries_per_round cannot be "
+                "combined with budget"
+            )
+
+        if (
+            budget is not None
+            or max_unique_objects is not None
+            or max_queries_per_round is not None
+            or return_report
+        ):
+            if budget is None:
+                budget = PrefetchBudget(
+                    max_depth=max_depth,
+                    max_unique_objects=max_unique_objects,
+                    max_queries_per_round=max_queries_per_round,
+                )
+            _, report = queryset._dereference(queryset, budget=budget)
+            queryset._set_dereference(queryset._dereference)
+            if return_report:
+                return queryset, report
+            return queryset
+
+        # Make select related work the same for querysets
+        return queryset._dereference(queryset, max_depth=max_depth + 1)
 
     def limit(self, n):
         """Limit the number of returned documents to `n`. This may also be
@@ -1815,6 +1857,9 @@ class BaseQuerySet:
         if not self.__dereference:
             self.__dereference = _import_class("DeReference")()
         return self.__dereference
+
+    def _set_dereference(self, dereferencer):
+        self.__dereference = dereferencer
 
     @property
     def _auto_dereference(self):

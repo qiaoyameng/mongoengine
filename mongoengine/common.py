@@ -38,6 +38,11 @@ def _import_class(cls_name):
     field_classes = _field_list_cache
 
     deref_classes = ("DeReference",)
+    prefetch_classes = (
+        "PrefetchBudget",
+        "PrefetchReport",
+        "UnresolvedReference",
+    )
 
     if cls_name == "BaseDocument":
         from mongoengine.base import document as module
@@ -55,6 +60,10 @@ def _import_class(cls_name):
         from mongoengine import dereference as module
 
         import_classes = deref_classes
+    elif cls_name in prefetch_classes:
+        from mongoengine import prefetch as module
+
+        import_classes = prefetch_classes
     else:
         raise ValueError("No import set for: %s" % cls_name)
 

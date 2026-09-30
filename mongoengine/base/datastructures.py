@@ -2,6 +2,7 @@ import weakref
 
 from bson import DBRef
 
+from mongoengine.base.common import _DocumentRegistry
 from mongoengine.common import _import_class
 from mongoengine.errors import DoesNotExist, MultipleObjectsReturned
 
@@ -11,6 +12,8 @@ __all__ = (
     "BaseList",
     "EmbeddedDocumentList",
     "LazyReference",
+    "BudgetedLazyReference",
+    "GenericBudgetedLazyReference",
 )
 
 
@@ -486,3 +489,60 @@ class LazyReference(DBRef):
 
     def __repr__(self):
         return f"<LazyReference({self.document_type}, {self.pk!r})>"
+
+
+class BudgetedLazyReference(LazyReference):
+    """A reference kept lazy because a prefetch budget was exhausted."""
+
+    __slots__ = ("_path", "_reason")
+
+    def __init__(self, document_type, pk, path=None, reason=None, **kwargs):
+        kwargs.setdefault("passthrough", False)
+        super().__init__(document_type, pk, **kwargs)
+        self._path = path
+        self._reason = reason
+
+    @property
+    def path(self):
+        return self._path
+
+    @property
+    def reason(self):
+        return self._reason
+
+    def __repr__(self):
+        return (
+            f"<BudgetedLazyReference(path={self._path!r}, "
+            f"document={self.document_type.__name__}, pk={self.pk!r}, "
+            f"reason={self._reason!r})>"
+        )
+
+
+class GenericBudgetedLazyReference(BudgetedLazyReference):
+    """A budgeted generic reference whose document class is unavailable."""
+
+    __slots__ = ("document_class_name",)
+
+    def __init__(
+        self, collection, pk, path=None, reason=None, document_class_name=None
+    ):
+        DBRef.__init__(self, collection, pk)
+        self.document_type = None
+        self._cached_doc = None
+        self.passthrough = False
+        self._path = path
+        self._reason = reason
+        self.document_class_name = document_class_name
+
+    def fetch(self, force=False):
+        if not self._cached_doc or force:
+            document_type = _DocumentRegistry.get(self.document_class_name)
+            self._cached_doc = document_type.objects.get(pk=self.pk)
+        return self._cached_doc
+
+    def __repr__(self):
+        return (
+            f"<GenericBudgetedLazyReference(path={self._path!r}, "
+            f"collection={self.collection!r}, pk={self.pk!r}, "
+            f"reason={self._reason!r})>"
+        )
