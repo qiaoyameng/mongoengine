@@ -7,6 +7,15 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add opt-in ``unknown_subclass_policy = "preserve"`` meta option: decoding a
+  document whose ``_cls`` is not registered (e.g. written by a newer service
+  during a rolling deployment) now returns a read-only
+  ``UnknownSubclassCarrier`` that preserves ``_cls``, all raw fields and the
+  primary key, instead of raising ``NotRegistered``. The carrier exposes the
+  fields shared with the queried class, refuses ``save``/``delete``/
+  ``update``/``modify``/``reload`` and any attribute mutation, and can be
+  turned back into a normal model with ``restore()`` once the class is
+  registered. The default behavior (raising ``NotRegistered``) is unchanged.
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
 
 Changes in 1.0.0

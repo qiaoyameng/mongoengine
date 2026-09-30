@@ -837,6 +837,40 @@ it's :attr:`_cls` attribute and use that class to construct the instance.::
     #   {'_cls': u 'Page.DatedPage', 'title': u 'another title', 'date': datetime.datetime(2019, 12, 13, 20, 16, 59, 993000)}
     # ]
 
+Unknown subclasses during rolling deployments
+---------------------------------------------
+
+During a rolling deployment, an old service may read documents written by a
+newer service whose subclass has not been imported (registered) in the old
+process yet. By default, MongoEngine raises
+:class:`~mongoengine.errors.NotRegistered` when it decodes such a document.
+
+A document class may opt into a gentler behavior with the
+:attr:`unknown_subclass_policy` meta option set to ``"preserve"``::
+
+    class Page(Document):
+        title = StringField(max_length=200, required=True)
+
+        meta = {
+            'allow_inheritance': True,
+            'unknown_subclass_policy': 'preserve',
+        }
+
+With this policy, decoding a document whose :attr:`_cls` is not registered
+returns a read-only :class:`~mongoengine.base.unknown.UnknownSubclassCarrier`
+instead of raising. The carrier preserves the original BSON exactly
+(:attr:`_cls`, every raw field and the primary key), exposes the fields it
+shares with the queried class as read-only attributes, and refuses every
+write entry point (:meth:`save`, :meth:`delete`, :meth:`update`,
+:meth:`modify`, :meth:`reload`) as well as attribute mutation. It never
+instantiates the parent class, so fields added by the newer service are never
+overwritten with defaults, and re-saving a parent document that embeds a
+carrier writes the unknown subdocument back unchanged.
+
+Once the real class is registered again, call
+:meth:`~mongoengine.base.unknown.UnknownSubclassCarrier.restore` (or simply
+re-decode the BSON) to get a normal model instance.
+
 Working with existing data
 --------------------------
 As MongoEngine no longer defaults to needing :attr:`_cls`, you can quickly and

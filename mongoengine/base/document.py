@@ -14,11 +14,16 @@ from mongoengine.base.datastructures import (
     StrictDict,
 )
 from mongoengine.base.fields import ComplexBaseField
+from mongoengine.base.unknown import (
+    PRESERVE_UNKNOWN_SUBCLASS_POLICY,
+    UnknownSubclassCarrier,
+)
 from mongoengine.common import _import_class
 from mongoengine.errors import (
     FieldDoesNotExist,
     InvalidDocumentError,
     LookUpError,
+    NotRegistered,
     OperationError,
     ValidationError,
 )
@@ -860,7 +865,19 @@ class BaseDocument:
 
         # Return correct subclass for document type
         if class_name != cls._class_name:
-            cls = _DocumentRegistry.get(class_name)
+            try:
+                cls = _DocumentRegistry.get(class_name)
+            except NotRegistered:
+                if (
+                    cls._meta.get("unknown_subclass_policy")
+                    == PRESERVE_UNKNOWN_SUBCLASS_POLICY
+                ):
+                    # The document was written with a subclass this process
+                    # hasn't registered (e.g. a newer service during a rolling
+                    # deployment). Return a read-only carrier that preserves
+                    # the raw BSON instead of dropping the unknown fields.
+                    return UnknownSubclassCarrier(cls, class_name, son)
+                raise
 
         errors_dict = {}
 

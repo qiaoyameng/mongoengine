@@ -32,6 +32,10 @@ from mongoengine.base import (
     ObjectIdField,
     _DocumentRegistry,
 )
+from mongoengine.base.unknown import (
+    PRESERVE_UNKNOWN_SUBCLASS_POLICY,
+    UnknownSubclassCarrier,
+)
 from mongoengine.base.utils import LazyRegexCompiler
 from mongoengine.common import _import_class
 from mongoengine.connection import (
@@ -43,6 +47,7 @@ from mongoengine.document import Document, EmbeddedDocument
 from mongoengine.errors import (
     DoesNotExist,
     InvalidQueryError,
+    NotRegistered,
     ValidationError,
 )
 from mongoengine.queryset import DO_NOTHING
@@ -756,6 +761,8 @@ class EmbeddedDocumentField(BaseField):
         return self.document_type_obj
 
     def to_python(self, value):
+        if isinstance(value, UnknownSubclassCarrier):
+            return value
         if not isinstance(value, self.document_type):
             return self.document_type._from_son(
                 value, _auto_dereference=self._auto_dereference
@@ -763,6 +770,10 @@ class EmbeddedDocumentField(BaseField):
         return value
 
     def to_mongo(self, value, use_db_field=True, fields=None):
+        if isinstance(value, UnknownSubclassCarrier):
+            # Pass the preserved BSON through untouched so re-saving a
+            # document holding an unknown subclass never loses data.
+            return value.to_mongo()
         if not isinstance(value, self.document_type):
             return value
         return self.document_type.to_mongo(value, use_db_field, fields)
@@ -771,6 +782,10 @@ class EmbeddedDocumentField(BaseField):
         """Make sure that the document instance is an instance of the
         EmbeddedDocument subclass provided when the document was defined.
         """
+        if isinstance(value, UnknownSubclassCarrier):
+            # The carrier holds raw BSON of an unregistered subclass; it is
+            # read-only and preserved as-is, so there is nothing to validate.
+            return
         # Using isinstance also works for subclasses of self.document
         if not isinstance(value, self.document_type):
             self.error(
@@ -1212,7 +1227,18 @@ class ReferenceField(BaseField):
         if auto_dereference and isinstance(ref_value, DBRef):
             if hasattr(ref_value, "cls"):
                 # Dereference using the class type specified in the reference
-                cls = _DocumentRegistry.get(ref_value.cls)
+                try:
+                    cls = _DocumentRegistry.get(ref_value.cls)
+                except NotRegistered:
+                    if (
+                        self.document_type._meta.get("unknown_subclass_policy")
+                        != PRESERVE_UNKNOWN_SUBCLASS_POLICY
+                    ):
+                        raise
+                    # The DBRef points at a subclass this process hasn't
+                    # registered; fall back to the declared document type so
+                    # _from_son returns a read-only carrier for it.
+                    cls = self.document_type
             else:
                 cls = self.document_type
 

@@ -9,6 +9,7 @@ from mongoengine.base.datastructures import *
 from mongoengine.base.document import *
 from mongoengine.base.fields import *
 from mongoengine.base.metaclasses import *
+from mongoengine.base.unknown import *
 
 __all__ = (
     # common
@@ -29,4 +30,7 @@ __all__ = (
     # metaclasses
     "DocumentMetaclass",
     "TopLevelDocumentMetaclass",
+    # unknown
+    "PRESERVE_UNKNOWN_SUBCLASS_POLICY",
+    "UnknownSubclassCarrier",
 )
