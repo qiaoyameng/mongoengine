@@ -6,7 +6,6 @@ import pymongo
 from bson import SON, DBRef, ObjectId, json_util
 
 from mongoengine import signals
-from mongoengine.base.common import _DocumentRegistry
 from mongoengine.base.datastructures import (
     BaseDict,
     BaseList,
@@ -46,6 +45,10 @@ class BaseDocument:
     _dynamic = False
     _dynamic_lock = True
     STRICT = False
+
+    # True on read-only placeholders built for unregistered subclasses
+    # (see mongoengine.base.unknown); always False on normal documents.
+    _is_unknown_subclass_placeholder = False
 
     def __init__(self, *args, **values):
         """
@@ -514,8 +517,9 @@ class BaseDocument:
         # If the value is a dict with '_cls' in it, turn it into a document
         is_dict = isinstance(value, dict)
         if is_dict and "_cls" in value:
-            cls = _DocumentRegistry.get(value["_cls"])
-            return cls(**value)
+            from mongoengine.base.unknown import decode_unknown_aware
+
+            return decode_unknown_aware(value, type(self))
 
         if is_dict:
             value = {k: self.__expand_dynamic_values(k, v) for k, v in value.items()}
@@ -860,7 +864,15 @@ class BaseDocument:
 
         # Return correct subclass for document type
         if class_name != cls._class_name:
-            cls = _DocumentRegistry.get(class_name)
+            from mongoengine.base.unknown import resolve_subclass
+
+            resolved = resolve_subclass(cls, son, _auto_dereference)
+            if isinstance(resolved, type):
+                # Registered subclass: decode it normally below.
+                cls = resolved
+            else:
+                # Read-only placeholder built for an unregistered subclass.
+                return resolved
 
         errors_dict = {}
 

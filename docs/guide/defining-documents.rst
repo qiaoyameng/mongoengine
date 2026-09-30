@@ -837,6 +837,55 @@ it's :attr:`_cls` attribute and use that class to construct the instance.::
     #   {'_cls': u 'Page.DatedPage', 'title': u 'another title', 'date': datetime.datetime(2019, 12, 13, 20, 16, 59, 993000)}
     # ]
 
+Reading data written by a newer version (unknown subclasses)
+------------------------------------------------------------
+
+During a rolling deployment an older instance of your application can read a
+document that was written by a newer instance which defines an additional
+subclass. The ``_cls`` value in that document then names a class that has not
+been imported yet, so it is missing from the document registry. By default
+decoding such a document raises
+:class:`~mongoengine.errors.NotRegistered`, which is the safest behaviour (it
+never silently instantiates the parent class and fills the new fields with
+defaults).
+
+If you want the old instance to be able to read those documents instead, set
+the ``unknown_subclass_policy`` meta option to ``"read_only"``::
+
+    class Page(Document):
+        title = StringField()
+        meta = {
+            'allow_inheritance': True,
+            'unknown_subclass_policy': 'read_only',
+        }
+
+With this policy a document whose ``_cls`` is unknown is decoded into a
+*read-only placeholder*: an instance of the closest known parent class that
+
+* keeps the original ``_cls`` value,
+* keeps the primary key,
+* lets you read every field declared on the known parent classes, and
+* keeps all extra fields (written by the unknown subclass) untouched and
+  readable (``document.<extra_field>`` or ``document._unknown_fields``).
+
+The placeholder deliberately rejects every write entry point
+(``save``, ``delete``, ``update``, ``modify`` and any field assignment or
+deletion) with :class:`~mongoengine.errors.ReadOnlyDocumentError`. This makes
+it impossible to overwrite the fields owned by the unknown subclass with the
+parent class defaults. Re-saving a *known* parent document that merely
+*contains* an unknown embedded document is still allowed and writes the
+unknown embedded data back unchanged.
+
+Dereferencing a :class:`~mongoengine.GenericReferenceField` (or a
+:class:`~mongoengine.ReferenceField` stored as a ``DBRef`` with a ``cls``)
+towards an unregistered class keeps raising
+:class:`~mongoengine.errors.NotRegistered`, regardless of the policy: an
+unknown reference is never silently turned into a writable parent instance.
+
+Once the subclass is imported (for example once the deployment has finished on
+that instance), decoding the same data again returns a normal, writable
+instance of that subclass.
+
 Working with existing data
 --------------------------
 As MongoEngine no longer defaults to needing :attr:`_cls`, you can quickly and

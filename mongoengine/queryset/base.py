@@ -78,10 +78,7 @@ class BaseQuerySet:
         # If inheritance is allowed, only return instances and instances of
         # subclasses of the class being used
         if document._meta.get("allow_inheritance") is True:
-            if len(self._document._subclasses) == 1:
-                self._cls_query = {"_cls": self._document._subclasses[0]}
-            else:
-                self._cls_query = {"_cls": {"$in": self._document._subclasses}}
+            self._cls_query = self._build_cls_query(document)
             self._loaded_fields = QueryFieldList(always_include=["_cls"])
 
         self._cursor_obj = None
@@ -100,6 +97,36 @@ class BaseQuerySet:
         # in that case and check for it when iterating. We also unset
         # it anytime we change _limit. Inspired by how it is done in pymongo.Cursor
         self._empty = False
+
+    @staticmethod
+    def _build_cls_query(document):
+        """Build the ``_cls`` selector for inheritance aware queries.
+
+        With the default unknown-subclass policy the selector only matches the
+        registered subclasses. With the ``read_only`` policy it also matches
+        not-yet-registered descendant classes (whose dotted ``_cls`` starts
+        with the queried class name) so they can be returned as read-only
+        placeholders during a rolling deployment.
+        """
+        from bson.regex import Regex
+
+        from mongoengine.base.unknown import UNKNOWN_SUBCLASS_READ_ONLY
+
+        if (
+            document._meta.get("unknown_subclass_policy")
+            == UNKNOWN_SUBCLASS_READ_ONLY
+        ):
+            # Match the class itself and every descendant, including ones not
+            # registered in this process yet (their dotted ``_cls`` starts
+            # with this class' name), so they can come back as read-only
+            # placeholders during a rolling deployment.
+            descendant_pattern = r"^%s\..*" % re.escape(document._class_name)
+            return {
+                "_cls": {"$in": [document._class_name, Regex(descendant_pattern)]}
+            }
+        if len(document._subclasses) == 1:
+            return {"_cls": document._subclasses[0]}
+        return {"_cls": {"$in": document._subclasses}}
 
     def __call__(self, q_obj=None, **query):
         """Filter the selected documents by calling the

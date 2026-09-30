@@ -235,7 +235,16 @@ class DeReference:
                     (items["_ref"].collection, items["_ref"].id), items
                 )
             elif "_cls" in items:
-                doc = _DocumentRegistry.get(items["_cls"])._from_son(items)
+                from mongoengine.base.unknown import decode_unknown_aware
+
+                doc = decode_unknown_aware(
+                    dict(items),
+                    getattr(instance, "__class__", None),
+                )
+                if getattr(doc, "_is_unknown_subclass_placeholder", False):
+                    # A read-only placeholder already owns its full raw
+                    # document; do not recurse into its (partly unknown) data.
+                    return doc
                 _cls = doc._data.pop("_cls", None)
                 del items["_cls"]
                 doc._data = self._attach_objects(doc._data, depth, doc, None)

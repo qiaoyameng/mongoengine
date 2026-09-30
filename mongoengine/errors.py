@@ -2,6 +2,8 @@ from collections import defaultdict
 
 __all__ = (
     "NotRegistered",
+    "UnknownSubclassError",
+    "ReadOnlyDocumentError",
     "InvalidDocumentError",
     "LookUpError",
     "DoesNotExist",
@@ -23,6 +25,15 @@ class MongoEngineException(Exception):
 
 class NotRegistered(MongoEngineException):
     pass
+
+
+class UnknownSubclassError(MongoEngineException):
+    """Raised when a document is decoded from data whose ``_cls`` marker
+    points to a document class that has not been registered (typically because
+    a newer version of the application wrote it during a rolling deployment)
+    and no :attr:`~mongoengine.Document` unknown-subclass policy allows the
+    data to be read.
+    """
 
 
 class InvalidDocumentError(MongoEngineException):
@@ -47,6 +58,13 @@ class InvalidQueryError(MongoEngineException):
 
 class OperationError(MongoEngineException):
     pass
+
+
+class ReadOnlyDocumentError(OperationError):
+    """Raised when an attempt is made to mutate or persist a read-only
+    placeholder document that was created to hold data belonging to an
+    unregistered document subclass.
+    """
 
 
 class NotUniqueError(OperationError):

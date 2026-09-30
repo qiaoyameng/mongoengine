@@ -175,6 +175,14 @@ class BaseField:
 
     def __set__(self, instance, value):
         """Descriptor for assigning a value to a field in a document."""
+        # Read-only placeholders for unregistered subclasses reject every
+        # mutation of their declared fields (except while they are built).
+        if (
+            instance is not None
+            and getattr(instance, "_is_unknown_subclass_placeholder", False)
+            and getattr(instance, "_initialised", False)
+        ):
+            raise instance._read_only_error()
         # If setting to None and there is a default value provided for this
         # field, then set the value to the default value.
         if value is None:

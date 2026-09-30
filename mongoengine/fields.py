@@ -765,6 +765,10 @@ class EmbeddedDocumentField(BaseField):
     def to_mongo(self, value, use_db_field=True, fields=None):
         if not isinstance(value, self.document_type):
             return value
+        if getattr(value, "_is_unknown_subclass_placeholder", False):
+            # A read-only placeholder re-emits its raw document so the fields
+            # owned by the unregistered subclass are preserved on save.
+            return value.to_mongo(use_db_field, fields)
         return self.document_type.to_mongo(value, use_db_field, fields)
 
     def validate(self, value, clean=True):
@@ -818,8 +822,9 @@ class GenericEmbeddedDocumentField(BaseField):
 
     def to_python(self, value):
         if isinstance(value, dict):
-            doc_cls = _DocumentRegistry.get(value["_cls"])
-            value = doc_cls._from_son(value)
+            from mongoengine.base.unknown import decode_unknown_aware
+
+            value = decode_unknown_aware(value, self.owner_document)
 
         return value
 
@@ -896,12 +901,21 @@ class DynamicField(BaseField):
 
     def to_python(self, value):
         if isinstance(value, dict) and "_cls" in value:
-            doc_cls = _DocumentRegistry.get(value["_cls"])
-            if "_ref" in value:
-                value = doc_cls._get_db().dereference(
+            from mongoengine.base.unknown import decode_unknown_aware
+
+            is_reference = "_ref" in value
+
+            def _dereference(registered_cls):
+                return registered_cls._get_db().dereference(
                     value["_ref"], session=_get_session()
                 )
-            return doc_cls._from_son(value)
+
+            return decode_unknown_aware(
+                value,
+                self.owner_document,
+                is_reference=is_reference,
+                dereference=_dereference if is_reference else None,
+            )
 
         return super().to_python(value)
 
