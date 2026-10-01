@@ -7,6 +7,7 @@ Changelog
 Development
 ===========
 - (Fill this out as you fix issues and develop your features).
+- Add opt-in ``QuerySet.aggregate(..., model_fields=True)`` static translation of MongoEngine field names to configured ``db_field`` names.
 - Fix partial ``Document.reload()`` leaving custom ``db_field`` values marked as changed.
 
 Changes in 1.0.0

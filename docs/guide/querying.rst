@@ -486,6 +486,24 @@ An example of its use would be::
         data = Person.objects().aggregate(pipeline)
         assert data == [{'name': 'BOB'}, {'name': 'JOHN'}]
 
+When model fields use ``db_field``, pass ``model_fields=True`` to translate
+MongoEngine field names in statically understood pipeline stages::
+
+        class Post(Document):
+            author_name = StringField(db_field="authorName")
+
+        pipeline = [
+            {"$match": {"author_name": "Ada"}},
+            {"$project": {"name": {"$toUpper": "$author_name"}}},
+        ]
+        Post.objects.aggregate(pipeline, model_fields=True)
+
+The transformer tracks fields introduced by projection/set/rename stages,
+``$unwind``, and the local variables used by ``$map``/``$filter``. Computed
+fields are not renamed merely because their output name matches a model field.
+Stages or expressions whose field paths cannot be resolved statically must be
+wrapped with ``$raw``; the pipeline passed by the caller is never modified.
+
 Query efficiency and performance
 ================================
 

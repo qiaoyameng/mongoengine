@@ -1,14 +1,177 @@
+import copy
+import unittest
 from unittest.mock import patch
 
 import pytest
 from pymongo.read_preferences import ReadPreference
 
-from mongoengine import Document, IntField, PointField, StringField
+from bson import encode
+
+from mongoengine import (
+    Document,
+    EmbeddedDocument,
+    EmbeddedDocumentField,
+    IntField,
+    ListField,
+    PointField,
+    StringField,
+)
+from mongoengine.errors import InvalidQueryError
+from mongoengine.queryset.aggregation import transform_pipeline
 from mongoengine.mongodb_support import (
     MONGODB_36,
     get_mongodb_version,
 )
 from tests.utils import MongoDBTestCase, db_ops_tracker
+
+
+class TestAggregationModelFields(unittest.TestCase):
+
+    def test_pipeline_conversion_and_non_mutation(self):
+        class AggComment(EmbeddedDocument):
+            author_name = StringField(db_field="authorName")
+
+        class AggPost(Document):
+            title = StringField(db_field="postTitle")
+            comments = ListField(
+                EmbeddedDocumentField(AggComment), db_field="postComments"
+            )
+
+        pipeline = [
+            {"$match": {"title": "first", "comments.author_name": "Ada"}},
+            {
+                "$project": {
+                    "title": 1,
+                    "comment": "$comments",
+                    "upper_title": {"$toUpper": "$title"},
+                    "author_names": {
+                        "$map": {
+                            "input": "$comments",
+                            "as": "comment",
+                            "in": {"$toUpper": "$$comment.author_name"},
+                        }
+                    },
+                    "active": {
+                        "$filter": {
+                            "input": "$comments",
+                            "as": "comment",
+                            "cond": {"$eq": ["$$comment.author_name", "$title"]},
+                        }
+                    },
+                    "root_title": "$$ROOT.title",
+                }
+            },
+            {"$match": {"upper_title": "FIRST"}},
+            {"$unwind": "$comment"},
+            {"$match": {"comment.author_name": "Ada"}},
+            {"$rename": {"comment": "renamedComment"}},
+            {"$match": {"renamedComment.author_name": "Ada"}},
+        ]
+        original_pipeline = copy.deepcopy(pipeline)
+
+        converted = transform_pipeline(AggPost, pipeline)
+
+        assert converted == [
+            {
+                "$match": {
+                    "postTitle": "first",
+                    "postComments.authorName": "Ada",
+                }
+            },
+            {
+                "$project": {
+                    "postTitle": True,
+                    "comment": "$postComments",
+                    "upper_title": {"$toUpper": "$postTitle"},
+                    "author_names": {
+                        "$map": {
+                            "input": "$postComments",
+                            "as": "comment",
+                            "in": {"$toUpper": "$$comment.authorName"},
+                        }
+                    },
+                    "active": {
+                        "$filter": {
+                            "input": "$postComments",
+                            "as": "comment",
+                            "cond": {"$eq": ["$$comment.authorName", "$postTitle"]},
+                        }
+                    },
+                    "root_title": "$$ROOT.postTitle",
+                }
+            },
+            {"$match": {"upper_title": "FIRST"}},
+            {"$unwind": "$comment"},
+            {"$match": {"comment.authorName": "Ada"}},
+            {"$rename": {"comment": "renamedComment"}},
+            {"$match": {"renamedComment.authorName": "Ada"}},
+        ]
+        assert pipeline == original_pipeline
+        encode({"pipeline": converted})
+
+    def test_requires_raw_for_unanalyzable_stage(self):
+        class RawDoc(Document):
+            name = StringField(db_field="realName")
+
+        with pytest.raises(InvalidQueryError, match=r"Use \$raw.*\$lookup"):
+            transform_pipeline(
+                RawDoc,
+                [
+                    {
+                        "$lookup": {
+                            "from": "other",
+                            "localField": "name",
+                            "foreignField": "name",
+                            "as": "others",
+                        }
+                    }
+                ],
+            )
+
+        converted = transform_pipeline(
+            RawDoc,
+            [
+                {
+                    "$raw": {
+                        "$lookup": {
+                            "from": "other",
+                            "localField": "name",
+                            "foreignField": "name",
+                            "as": "others",
+                        }
+                    }
+                },
+                {"$match": {"others.name": "Ada"}},
+            ],
+        )
+        assert converted[0]["$lookup"]["localField"] == "name"
+        assert converted[1] == {"$match": {"others.name": "Ada"}}
+
+    def test_queryset_aggregate_model_fields_does_not_mutate_pipeline(self):
+        class NonMutatingDoc(Document):
+            display_name = StringField(db_field="displayName")
+
+        pipeline = [{"$match": {"display_name": "Ada"}}]
+        original_pipeline = copy.deepcopy(pipeline)
+
+        with patch.object(NonMutatingDoc, "_collection") as collection:
+            NonMutatingDoc.objects.aggregate(pipeline, model_fields=True)
+
+        assert pipeline == original_pipeline
+        assert collection.aggregate.call_args.args[0] == [
+            {"$match": {"displayName": "Ada"}}
+        ]
+
+    def test_queryset_aggregate_default_passes_pipeline_unchanged(self):
+        class DefaultDoc(Document):
+            display_name = StringField(db_field="displayName")
+
+        pipeline = [{"$match": {"display_name": "Ada"}}]
+
+        with patch.object(DefaultDoc, "_collection") as collection:
+            DefaultDoc.objects.aggregate(pipeline)
+
+        assert collection.aggregate.call_args.args[0] == pipeline
 
 
 class TestQuerysetAggregate(MongoDBTestCase):
@@ -393,3 +556,56 @@ class TestQuerysetAggregate(MongoDBTestCase):
                     search_step,
                     {"$match": {"last_name": "bar"}},
                 ]
+
+    def test_queryset_aggregate_model_fields_end_to_end(self):
+        class AggComment(EmbeddedDocument):
+            author_name = StringField(db_field="authorName")
+
+        class AggPost(Document):
+            title = StringField(db_field="postTitle")
+            comments = ListField(
+                EmbeddedDocumentField(AggComment), db_field="postComments"
+            )
+
+        AggPost.drop_collection()
+        AggPost(
+            title="first",
+            comments=[
+                AggComment(author_name="Ada"),
+                AggComment(author_name="Grace"),
+            ],
+        ).save()
+        AggPost(title="second", comments=[AggComment(author_name="Katherine")]).save()
+
+        pipeline = [
+            {"$match": {"title": "first"}},
+            {
+                "$project": {
+                    "title": 1,
+                    "comment": "$comments",
+                    "author_names": {
+                        "$map": {
+                            "input": "$comments",
+                            "as": "comment",
+                            "in": "$$comment.author_name",
+                        }
+                    },
+                    "is_ada": {
+                        "$filter": {
+                            "input": "$comments",
+                            "as": "comment",
+                            "cond": {"$eq": ["$$comment.author_name", "Ada"]},
+                        }
+                    },
+                }
+            },
+            {"$unwind": "$comment"},
+            {"$match": {"comment.author_name": "Ada"}},
+            {"$project": {"_id": 0, "title": 1, "author_names": 1}},
+        ]
+
+        result = list(AggPost.objects.aggregate(pipeline, model_fields=True))
+
+        assert len(result) == 1
+        assert result[0]["postTitle"] == "first"
+        assert result[0]["author_names"] == ["Ada", "Grace"]

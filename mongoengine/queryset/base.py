@@ -33,6 +33,7 @@ from mongoengine.pymongo_support import (
     LEGACY_JSON_OPTIONS,
     count_documents,
 )
+from mongoengine.queryset.aggregation import transform_pipeline
 from mongoengine.queryset import transform
 from mongoengine.queryset.field_list import QueryFieldList
 from mongoengine.queryset.visitor import Q, QNode
@@ -1336,7 +1337,7 @@ class BaseQuerySet:
         son_data = json_util.loads(json_data)
         return [self._document._from_son(data) for data in son_data]
 
-    def aggregate(self, pipeline, **kwargs):
+    def aggregate(self, pipeline, model_fields=False, **kwargs):
         """Perform an aggregate function based on your queryset params
 
         If the queryset contains a query or skip/limit/sort or if the target Document class
@@ -1349,6 +1350,8 @@ class BaseQuerySet:
 
         :param pipeline: list of aggregation commands,
             see: https://www.mongodb.com/docs/manual/core/aggregation-pipeline/
+        :param model_fields: when True, translate MongoEngine field names in
+            pipeline expressions to their configured ``db_field`` names
         :param kwargs: (optional) kwargs dictionary to be passed to pymongo's aggregate call
             See https://pymongo.readthedocs.io/en/stable/api/pymongo/collection.html#pymongo.collection.Collection.aggregate
         """
@@ -1377,6 +1380,9 @@ class BaseQuerySet:
 
         if self._skip is not None:
             initial_pipeline.append({"$skip": self._skip})
+
+        if model_fields:
+            pipeline = transform_pipeline(self._document, pipeline)
 
         # Some aggregation stages must precede MongoEngine's implicit stages.
         first_step = []
