@@ -1,4 +1,5 @@
 from mongoengine.errors import *
+from mongoengine.queryset.aggregate import *
 from mongoengine.queryset.field_list import *
 from mongoengine.queryset.manager import *
 from mongoengine.queryset.queryset import *
@@ -13,6 +14,9 @@ __all__ = (
     "queryset_manager",
     "QuerySetManager",
     "QueryFieldList",
+    "raw",
+    "Raw",
+    "translate_pipeline",
     "DO_NOTHING",
     "NULLIFY",
     "CASCADE",

@@ -486,6 +486,42 @@ An example of its use would be::
         data = Person.objects().aggregate(pipeline)
         assert data == [{'name': 'BOB'}, {'name': 'JOHN'}]
 
+Translating model field names
+-----------------------------
+By default, aggregation pipelines are passed to the server untouched, so they
+must use the database field names (``db_field``). If your model renames fields,
+you can instead write pipelines with the python attribute names by passing
+``translate_fields=True``::
+
+        class Order(Document):
+            name = StringField(db_field="n")
+            items = ListField(EmbeddedDocumentField(Item), db_field="itms")
+
+        pipeline = [
+            {"$unwind": "$items"},
+            {"$match": {"items.price": {"$gte": 10}}},
+            {"$project": {"sku": "$items.sku", "order_total": "$$ROOT.total"}},
+        ]
+        data = Order.objects.aggregate(pipeline, translate_fields=True)
+
+The translator tracks the fields produced by each stage (``$project``,
+``$addFields``, ``$group``, ``$unwind``, ...) so computed fields are never
+renamed as if they were model fields, and it understands ``$map``/``$filter``
+variable scopes as well as ``$$ROOT``/``$$CURRENT``. Stages that cannot be
+analyzed statically (e.g. ``$lookup``) raise an error unless they are wrapped
+in :func:`mongoengine.queryset.aggregate.raw`, which passes them through
+unchanged::
+
+        from mongoengine.queryset.aggregate import raw
+
+        pipeline = [
+            {"$match": {"name": "foo"}},
+            raw({"$lookup": {"from": "other", "localField": "n",
+                             "foreignField": "x", "as": "joined"}}),
+        ]
+
+The input pipeline is never modified in place.
+
 Query efficiency and performance
 ================================
 

@@ -34,6 +34,7 @@ from mongoengine.pymongo_support import (
     count_documents,
 )
 from mongoengine.queryset import transform
+from mongoengine.queryset.aggregate import translate_pipeline
 from mongoengine.queryset.field_list import QueryFieldList
 from mongoengine.queryset.visitor import Q, QNode
 
@@ -1336,7 +1337,7 @@ class BaseQuerySet:
         son_data = json_util.loads(json_data)
         return [self._document._from_son(data) for data in son_data]
 
-    def aggregate(self, pipeline, **kwargs):
+    def aggregate(self, pipeline, translate_fields=False, **kwargs):
         """Perform an aggregate function based on your queryset params
 
         If the queryset contains a query or skip/limit/sort or if the target Document class
@@ -1349,6 +1350,13 @@ class BaseQuerySet:
 
         :param pipeline: list of aggregation commands,
             see: https://www.mongodb.com/docs/manual/core/aggregation-pipeline/
+        :param translate_fields: (optional) when True, the given pipeline is written with the
+            model (python) field names and is translated to the actual database field names
+            (``db_field``) before being sent to the server. The translator tracks fields
+            produced by each stage (``$project``, ``$group``, ``$unwind``, ...) and
+            understands ``$map``/``$filter`` variables and ``$$ROOT``. Stages that cannot
+            be analyzed statically (e.g. ``$lookup``) must be wrapped in
+            ``mongoengine.queryset.aggregate.raw``. The input pipeline is not mutated.
         :param kwargs: (optional) kwargs dictionary to be passed to pymongo's aggregate call
             See https://pymongo.readthedocs.io/en/stable/api/pymongo/collection.html#pymongo.collection.Collection.aggregate
         """
@@ -1356,6 +1364,9 @@ class BaseQuerySet:
             raise TypeError(
                 f"Starting from 1.0 release pipeline must be a list/tuple, received: {type(pipeline)}"
             )
+
+        if translate_fields:
+            pipeline = translate_pipeline(self._document, pipeline)
 
         initial_pipeline = []
         if self._none or self._empty:
